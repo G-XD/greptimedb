@@ -17,9 +17,9 @@ use std::sync::{Arc, Weak};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use common_catalog::consts::INFORMATION_SCHEMA_TABLES_TABLE_ID;
 use common_error::ext::BoxedError;
-use common_query::physical_plan::TaskContext;
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DfRecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream as DfPartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream as DfSendableRecordBatchStream;
@@ -105,7 +105,9 @@ impl InformationTable for InformationSchemaTables {
                     .make_tables(Some(request))
                     .await
                     .map(|x| x.into_df_record_batch())
-                    .map_err(Into::into)
+                    .map_err(|err| {
+                        datafusion::error::DataFusionError::External(format!("{err:?}").into())
+                    })
             }),
         ));
         Ok(Box::pin(
@@ -161,7 +163,7 @@ impl InformationSchemaTablesBuilder {
         let predicates = Predicates::from_scan_request(&request);
 
         for schema_name in catalog_manager.schema_names(&catalog_name).await? {
-            let mut stream = catalog_manager.tables(&catalog_name, &schema_name).await;
+            let mut stream = catalog_manager.tables(&catalog_name, &schema_name);
 
             while let Some(table) = stream.try_next().await? {
                 let table_info = table.table_info();

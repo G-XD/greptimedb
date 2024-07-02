@@ -45,9 +45,9 @@ use crate::instruction::CacheIdent;
 use crate::key::table_info::TableInfoValue;
 use crate::key::DeserializedValueWithBytes;
 use crate::lock_key::{CatalogLock, SchemaLock, TableLock, TableNameLock};
-use crate::metrics;
 use crate::rpc::ddl::AlterTableTask;
 use crate::rpc::router::{find_leader_regions, find_leaders};
+use crate::{metrics, ClusterId};
 
 /// The alter table procedure
 pub struct AlterTableProcedure {
@@ -61,7 +61,7 @@ impl AlterTableProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::AlterTable";
 
     pub fn new(
-        cluster_id: u64,
+        cluster_id: ClusterId,
         table_id: TableId,
         task: AlterTableTask,
         context: DdlContext,
@@ -172,20 +172,16 @@ impl AlterTableProcedure {
 
     /// Broadcasts the invalidating table cache instructions.
     async fn on_broadcast(&mut self) -> Result<Status> {
-        // Safety: Checked in `AlterTableProcedure::new`.
-        let alter_kind = self.data.task.alter_table.kind.as_ref().unwrap();
         let cache_invalidator = &self.context.cache_invalidator;
-        let cache_keys = if matches!(alter_kind, Kind::RenameTable { .. }) {
-            vec![CacheIdent::TableName(self.data.table_ref().into())]
-        } else {
-            vec![
-                CacheIdent::TableId(self.data.table_id()),
-                CacheIdent::TableName(self.data.table_ref().into()),
-            ]
-        };
 
         cache_invalidator
-            .invalidate(&Context::default(), cache_keys)
+            .invalidate(
+                &Context::default(),
+                &[
+                    CacheIdent::TableId(self.data.table_id()),
+                    CacheIdent::TableName(self.data.table_ref().into()),
+                ],
+            )
             .await?;
 
         Ok(Status::done())
@@ -269,7 +265,7 @@ enum AlterTableState {
 // The serialized data of alter table.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlterTableData {
-    cluster_id: u64,
+    cluster_id: ClusterId,
     state: AlterTableState,
     task: AlterTableTask,
     table_id: TableId,

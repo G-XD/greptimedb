@@ -14,80 +14,48 @@
 
 #![doc = include_str!("../../../../README.md")]
 
-use std::fmt;
-
-use clap::{FromArgMatches, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use cmd::error::Result;
-use cmd::options::{CliOptions, Options};
-use cmd::{
-    cli, datanode, frontend, greptimedb_cli, log_versions, metasrv, standalone, start_app, App,
-};
-use common_version::{short_version, version};
+use cmd::options::GlobalOptions;
+use cmd::{cli, datanode, flownode, frontend, metasrv, standalone, App};
+use common_version::version;
 
 #[derive(Parser)]
+#[command(name = "greptime", author, version, long_version = version!(), about)]
+#[command(propagate_version = true)]
+pub(crate) struct Command {
+    #[clap(subcommand)]
+    pub(crate) subcmd: SubCommand,
+
+    #[clap(flatten)]
+    pub(crate) global_options: GlobalOptions,
+}
+
+#[derive(Subcommand)]
 enum SubCommand {
+    /// Start datanode service.
     #[clap(name = "datanode")]
     Datanode(datanode::Command),
+
+    /// Start flownode service.
+    #[clap(name = "flownode")]
+    Flownode(flownode::Command),
+
+    /// Start frontend service.
     #[clap(name = "frontend")]
     Frontend(frontend::Command),
+
+    /// Start metasrv service.
     #[clap(name = "metasrv")]
     Metasrv(metasrv::Command),
+
+    /// Run greptimedb as a standalone service.
     #[clap(name = "standalone")]
     Standalone(standalone::Command),
+
+    /// Execute the cli tools for greptimedb.
     #[clap(name = "cli")]
     Cli(cli::Command),
-}
-
-impl SubCommand {
-    async fn build(self, opts: Options) -> Result<Box<dyn App>> {
-        let app: Box<dyn App> = match (self, opts) {
-            (SubCommand::Datanode(cmd), Options::Datanode(dn_opts)) => {
-                let app = cmd.build(*dn_opts).await?;
-                Box::new(app) as _
-            }
-            (SubCommand::Frontend(cmd), Options::Frontend(fe_opts)) => {
-                let app = cmd.build(*fe_opts).await?;
-                Box::new(app) as _
-            }
-            (SubCommand::Metasrv(cmd), Options::Metasrv(meta_opts)) => {
-                let app = cmd.build(*meta_opts).await?;
-                Box::new(app) as _
-            }
-            (SubCommand::Standalone(cmd), Options::Standalone(opts)) => {
-                let app = cmd.build(*opts).await?;
-                Box::new(app) as _
-            }
-            (SubCommand::Cli(cmd), Options::Cli(_)) => {
-                let app = cmd.build().await?;
-                Box::new(app) as _
-            }
-
-            _ => unreachable!(),
-        };
-        Ok(app)
-    }
-
-    fn load_options(&self, cli_options: &CliOptions) -> Result<Options> {
-        match self {
-            SubCommand::Datanode(cmd) => cmd.load_options(cli_options),
-            SubCommand::Frontend(cmd) => cmd.load_options(cli_options),
-            SubCommand::Metasrv(cmd) => cmd.load_options(cli_options),
-            SubCommand::Standalone(cmd) => cmd.load_options(cli_options),
-            SubCommand::Cli(cmd) => cmd.load_options(cli_options),
-        }
-    }
-}
-
-impl fmt::Display for SubCommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SubCommand::Datanode(..) => write!(f, "greptime-datanode"),
-            SubCommand::Frontend(..) => write!(f, "greptime-frontend"),
-            SubCommand::Metasrv(..) => write!(f, "greptime-metasrv"),
-            SubCommand::Standalone(..) => write!(f, "greptime-standalone"),
-            SubCommand::Cli(_) => write!(f, "greptime-cli"),
-        }
-    }
 }
 
 #[cfg(not(windows))]
@@ -96,6 +64,52 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    setup_human_panic();
+    start(Command::parse()).await
+}
+
+async fn start(cli: Command) -> Result<()> {
+    match cli.subcmd {
+        SubCommand::Datanode(cmd) => {
+            cmd.build(cmd.load_options(&cli.global_options)?)
+                .await?
+                .run()
+                .await
+        }
+        SubCommand::Flownode(cmd) => {
+            cmd.build(cmd.load_options(&cli.global_options)?)
+                .await?
+                .run()
+                .await
+        }
+        SubCommand::Frontend(cmd) => {
+            cmd.build(cmd.load_options(&cli.global_options)?)
+                .await?
+                .run()
+                .await
+        }
+        SubCommand::Metasrv(cmd) => {
+            cmd.build(cmd.load_options(&cli.global_options)?)
+                .await?
+                .run()
+                .await
+        }
+        SubCommand::Standalone(cmd) => {
+            cmd.build(cmd.load_options(&cli.global_options)?)
+                .await?
+                .run()
+                .await
+        }
+        SubCommand::Cli(cmd) => {
+            cmd.build(cmd.load_options(&cli.global_options)?)
+                .await?
+                .run()
+                .await
+        }
+    }
+}
+
+fn setup_human_panic() {
     let metadata = human_panic::Metadata {
         version: env!("CARGO_PKG_VERSION").into(),
         name: "GreptimeDB".into(),
@@ -105,35 +119,4 @@ async fn main() -> Result<()> {
     human_panic::setup_panic!(metadata);
 
     common_telemetry::set_panic_hook();
-
-    let version = version!();
-    let cli = greptimedb_cli().version(version);
-
-    let cli = SubCommand::augment_subcommands(cli);
-
-    let args = cli.get_matches();
-
-    let subcmd = match SubCommand::from_arg_matches(&args) {
-        Ok(subcmd) => subcmd,
-        Err(e) => e.exit(),
-    };
-
-    let app_name = subcmd.to_string();
-
-    let cli_options = CliOptions::new(&args);
-
-    let opts = subcmd.load_options(&cli_options)?;
-
-    let _guard = common_telemetry::init_global_logging(
-        &app_name,
-        opts.logging_options(),
-        cli_options.tracing_options(),
-        opts.node_id(),
-    );
-
-    log_versions(version, short_version!());
-
-    let app = subcmd.build(opts).await?;
-
-    start_app(app).await
 }

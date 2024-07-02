@@ -16,12 +16,20 @@
 
 use std::any::Any;
 
+use arrow_schema::ArrowError;
+use common_error::ext::BoxedError;
 use common_macro::stack_trace_debug;
 use common_telemetry::common_error::ext::ErrorExt;
 use common_telemetry::common_error::status_code::StatusCode;
+use datafusion_common::DataFusionError;
 use datatypes::data_type::ConcreteDataType;
 use serde::{Deserialize, Serialize};
-use snafu::{Location, Snafu};
+use snafu::{Location, ResultExt, Snafu};
+
+fn is_send_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<EvalError>();
+}
 
 /// EvalError is about errors happen on columnar evaluation
 ///
@@ -31,24 +39,33 @@ use snafu::{Location, Snafu};
 #[stack_trace_debug]
 pub enum EvalError {
     #[snafu(display("Division by zero"))]
-    DivisionByZero { location: Location },
+    DivisionByZero {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Type mismatch: expected {expected}, actual {actual}"))]
     TypeMismatch {
         expected: ConcreteDataType,
         actual: ConcreteDataType,
+        #[snafu(implicit)]
         location: Location,
     },
 
     /// can't nest datatypes error because EvalError need to be store in map and serialization
     #[snafu(display("Fail to unpack from value to given type: {msg}"))]
-    TryFromValue { msg: String, location: Location },
+    TryFromValue {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Fail to cast value of type {from} to given type {to}"))]
     CastValue {
         from: ConcreteDataType,
         to: ConcreteDataType,
         source: datatypes::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -56,18 +73,64 @@ pub enum EvalError {
     DataType {
         msg: String,
         source: datatypes::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid argument: {reason}"))]
-    InvalidArgument { reason: String, location: Location },
+    InvalidArgument {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Internal error: {reason}"))]
-    Internal { reason: String, location: Location },
+    Internal {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Optimize error: {reason}"))]
-    Optimize { reason: String, location: Location },
+    Optimize {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Overflowed during evaluation"))]
-    Overflow { location: Location },
+    Overflow {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Incoming data already expired by {} ms", expired_by))]
+    DataAlreadyExpired {
+        expired_by: i64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Arrow error: {raw:?}, context: {context}"))]
+    Arrow {
+        raw: ArrowError,
+        context: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("DataFusion error: {raw:?}, context: {context}"))]
+    Datafusion {
+        raw: DataFusionError,
+        context: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("External error"))]
+    External {
+        #[snafu(implicit)]
+        location: Location,
+        source: BoxedError,
+    },
 }

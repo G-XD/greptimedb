@@ -15,9 +15,11 @@
 use std::collections::HashMap;
 
 use common_catalog::consts::default_engine;
+use datafusion_common::ScalarValue;
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, IntervalUnit};
 use itertools::Itertools;
 use snafu::{ensure, OptionExt, ResultExt};
-use sqlparser::ast::{ColumnOption, ColumnOptionDef, DataType, Expr};
+use sqlparser::ast::{ColumnOption, ColumnOptionDef, DataType, Expr, KeyOrIndexDisplay};
 use sqlparser::dialect::keywords::Keyword;
 use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::IsOptional::Mandatory;
@@ -25,15 +27,17 @@ use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, TokenWithLocation, Word};
 use table::requests::validate_table_option;
 
+use super::utils;
 use crate::ast::{ColumnDef, Ident, TableConstraint};
 use crate::error::{
-    self, InvalidColumnOptionSnafu, InvalidTableOptionSnafu, InvalidTimeIndexSnafu,
-    MissingTimeIndexSnafu, Result, SyntaxSnafu, UnexpectedSnafu, UnsupportedSnafu,
+    self, InvalidColumnOptionSnafu, InvalidDatabaseOptionSnafu, InvalidIntervalSnafu,
+    InvalidTableOptionSnafu, InvalidTimeIndexSnafu, MissingTimeIndexSnafu, Result, SyntaxSnafu,
+    UnexpectedSnafu, UnsupportedSnafu,
 };
-use crate::parser::ParserContext;
+use crate::parser::{ParserContext, FLOW};
 use crate::statements::create::{
-    CreateDatabase, CreateExternalTable, CreateFlow, CreateTable, CreateTableLike, Partitions,
-    TIME_INDEX,
+    CreateDatabase, CreateExternalTable, CreateFlow, CreateTable, CreateTableLike, CreateView,
+    Partitions, TIME_INDEX,
 };
 use crate::statements::statement::Statement;
 use crate::statements::{get_data_type_by_alias_name, OptionMap};
@@ -41,10 +45,15 @@ use crate::util::parse_option_string;
 
 pub const ENGINE: &str = "ENGINE";
 pub const MAXVALUE: &str = "MAXVALUE";
-pub const FLOW: &str = "FLOW";
 pub const SINK: &str = "SINK";
 pub const EXPIRE: &str = "EXPIRE";
-pub const WHEN: &str = "WHEN";
+pub const AFTER: &str = "AFTER";
+
+const DB_OPT_KEY_TTL: &str = "ttl";
+
+fn validate_database_option(key: &str) -> bool {
+    [DB_OPT_KEY_TTL].contains(&key)
+}
 
 /// Parses create [table] statement
 impl<'a> ParserContext<'a> {
@@ -64,6 +73,7 @@ impl<'a> ParserContext<'a> {
                         .context(SyntaxSnafu)?;
                     match self.parser.next_token().token {
                         Token::Word(w) => match w.keyword {
+                            Keyword::VIEW => self.parse_create_view(true),
                             Keyword::NoKeyword => {
                                 let uppercase = w.value.to_uppercase();
                                 match uppercase.as_str() {
@@ -77,6 +87,11 @@ impl<'a> ParserContext<'a> {
                     }
                 }
 
+                Keyword::VIEW => {
+                    let _ = self.parser.next_token();
+                    self.parse_create_view(false)
+                }
+
                 Keyword::NoKeyword => {
                     let _ = self.parser.next_token();
                     let uppercase = w.value.to_uppercase();
@@ -85,11 +100,29 @@ impl<'a> ParserContext<'a> {
                         _ => self.unsupported(w.to_string()),
                     }
                 }
-
                 _ => self.unsupported(w.to_string()),
             },
             unexpected => self.unsupported(unexpected.to_string()),
         }
+    }
+
+    /// Parse `CREAVE VIEW` statement.
+    fn parse_create_view(&mut self, or_replace: bool) -> Result<Statement> {
+        let if_not_exists = self.parse_if_not_exist()?;
+        let view_name = self.intern_parse_table_name()?;
+
+        self.parser
+            .expect_keyword(Keyword::AS)
+            .context(SyntaxSnafu)?;
+
+        let query = self.parse_query()?;
+
+        Ok(Statement::CreateView(CreateView {
+            name: view_name,
+            or_replace,
+            query: Box::new(query),
+            if_not_exists,
+        }))
     }
 
     fn parse_create_external_table(&mut self) -> Result<Statement> {
@@ -125,9 +158,28 @@ impl<'a> ParserContext<'a> {
             actual: self.peek_token_as_string(),
         })?;
         let database_name = Self::canonicalize_object_name(database_name);
+
+        let options = self
+            .parser
+            .parse_options(Keyword::WITH)
+            .context(SyntaxSnafu)?
+            .into_iter()
+            .map(parse_option_string)
+            .collect::<Result<HashMap<String, String>>>()?;
+
+        for key in options.keys() {
+            ensure!(
+                validate_database_option(key),
+                InvalidDatabaseOptionSnafu {
+                    key: key.to_string()
+                }
+            );
+        }
+
         Ok(Statement::CreateDatabase(CreateDatabase {
             name: database_name,
             if_not_exists,
+            options: options.into(),
         }))
     }
 
@@ -186,11 +238,28 @@ impl<'a> ParserContext<'a> {
 
         let output_table_name = self.intern_parse_table_name()?;
 
-        let expire_when = if self
+        let expire_after = if self
             .parser
-            .consume_tokens(&[Token::make_keyword(EXPIRE), Token::make_keyword(WHEN)])
+            .consume_tokens(&[Token::make_keyword(EXPIRE), Token::make_keyword(AFTER)])
         {
-            Some(self.parser.parse_expr().context(error::SyntaxSnafu)?)
+            let expire_after_expr = self.parser.parse_expr().context(error::SyntaxSnafu)?;
+            let expire_after_lit = utils::parser_expr_to_scalar_value(expire_after_expr.clone())?
+                .cast_to(&ArrowDataType::Interval(IntervalUnit::MonthDayNano))
+                .ok()
+                .with_context(|| InvalidIntervalSnafu {
+                    reason: format!("cannot cast {} to interval type", expire_after_expr),
+                })?;
+            if let ScalarValue::IntervalMonthDayNano(Some(nanoseconds)) = expire_after_lit {
+                Some(
+                    i64::try_from(nanoseconds / 1_000_000_000)
+                        .ok()
+                        .with_context(|| InvalidIntervalSnafu {
+                            reason: format!("interval {} overflows", nanoseconds),
+                        })?,
+                )
+            } else {
+                unreachable!()
+            }
         } else {
             None
         };
@@ -223,7 +292,7 @@ impl<'a> ParserContext<'a> {
             sink_table_name: output_table_name,
             or_replace,
             if_not_exists,
-            expire_when,
+            expire_after,
             comment,
             query,
         }))
@@ -414,8 +483,11 @@ impl<'a> ParserContext<'a> {
                             value: column.name.value.clone(),
                             quote_style: None,
                         }],
-                        is_primary: false,
                         characteristics: None,
+                        index_name: None,
+                        index_type_display: KeyOrIndexDisplay::None,
+                        index_type: None,
+                        index_options: vec![],
                     };
                     constraints.push(constraint);
                 }
@@ -584,10 +656,12 @@ impl<'a> ParserContext<'a> {
                     .into_iter()
                     .map(Self::canonicalize_identifier)
                     .collect();
-                Ok(Some(TableConstraint::Unique {
+                Ok(Some(TableConstraint::PrimaryKey {
                     name,
+                    index_name: None,
+                    index_type: None,
                     columns,
-                    is_primary: true,
+                    index_options: vec![],
                     characteristics: None,
                 }))
             }
@@ -627,8 +701,11 @@ impl<'a> ParserContext<'a> {
                         quote_style: None,
                     }),
                     columns,
-                    is_primary: false,
                     characteristics: None,
+                    index_name: None,
+                    index_type_display: KeyOrIndexDisplay::None,
+                    index_type: None,
+                    index_options: vec![],
                 }))
             }
             unexpected => {
@@ -672,7 +749,6 @@ fn validate_time_index(columns: &[ColumnDef], constraints: &[TableConstraint]) -
             if let TableConstraint::Unique {
                 name: Some(ident),
                 columns,
-                is_primary: false,
                 ..
             } = c
             {
@@ -828,7 +904,7 @@ mod tests {
     use common_catalog::consts::FILE_ENGINE;
     use common_error::ext::ErrorExt;
     use sqlparser::ast::ColumnOption::NotNull;
-    use sqlparser::ast::{BinaryOperator, Expr, Function, Interval, ObjectName, Value};
+    use sqlparser::ast::{BinaryOperator, Expr, ObjectName, Value};
 
     use super::*;
     use crate::dialect::GreptimeDbDialect;
@@ -966,20 +1042,11 @@ mod tests {
                 assert_column_def(&columns[3], "memory", "FLOAT64");
 
                 let constraints = &c.constraints;
-                assert_matches!(
-                    &constraints[0],
-                    TableConstraint::Unique {
-                        is_primary: false,
+                assert!(matches!(&constraints[0], TableConstraint::Unique {
+                        name: Some(name),
                         ..
-                    }
-                );
-                assert_matches!(
-                    &constraints[1],
-                    TableConstraint::Unique {
-                        is_primary: true,
-                        ..
-                    }
-                );
+                    }  if name.value == TIME_INDEX));
+                assert_matches!(&constraints[1], TableConstraint::PrimaryKey { .. });
             }
             _ => unreachable!(),
         }
@@ -1026,14 +1093,27 @@ mod tests {
         let sql = "CREATE DATABASE `fOo`";
         let result =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
-        let mut stmts = result.unwrap();
-        assert_eq!(
-            stmts.pop().unwrap(),
-            Statement::CreateDatabase(CreateDatabase::new(
-                ObjectName(vec![Ident::with_quote('`', "fOo"),]),
-                false
-            ))
-        );
+        let stmts = result.unwrap();
+        match &stmts.last().unwrap() {
+            Statement::CreateDatabase(c) => {
+                assert_eq!(c.name, ObjectName(vec![Ident::with_quote('`', "fOo")]));
+                assert!(!c.if_not_exists);
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "CREATE DATABASE prometheus with (ttl='1h');";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let stmts = result.unwrap();
+        match &stmts[0] {
+            Statement::CreateDatabase(c) => {
+                assert_eq!(c.name.to_string(), "prometheus");
+                assert!(!c.if_not_exists);
+                assert_eq!(c.options.get("ttl").unwrap(), "1h");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -1041,7 +1121,7 @@ mod tests {
         let sql = r"
 CREATE OR REPLACE FLOW IF NOT EXISTS task_1
 SINK TO schema_1.table_1
-EXPIRE WHEN timestamp < now() - INTERVAL '5m'
+EXPIRE AFTER INTERVAL '5 minutes'
 COMMENT 'test comment'
 AS
 SELECT max(c1), min(c2) FROM schema_2.table_2;";
@@ -1071,43 +1151,14 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
             ]),
             or_replace: true,
             if_not_exists: true,
-            expire_when: Some(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident {
-                    value: "timestamp".to_string(),
-                    quote_style: None,
-                })),
-                op: BinaryOperator::Lt,
-                right: Box::new(Expr::BinaryOp {
-                    left: Box::new(Expr::Function(Function {
-                        name: ObjectName(vec![Ident {
-                            value: "now".to_string(),
-                            quote_style: None,
-                        }]),
-                        args: vec![],
-                        filter: None,
-                        null_treatment: None,
-                        over: None,
-                        distinct: false,
-                        special: false,
-                        order_by: vec![],
-                    })),
-                    op: BinaryOperator::Minus,
-                    right: Box::new(Expr::Interval(Interval {
-                        value: Box::new(Expr::Value(Value::SingleQuotedString("5m".to_string()))),
-                        leading_field: None,
-                        leading_precision: None,
-                        last_field: None,
-                        fractional_seconds_precision: None,
-                    })),
-                }),
-            }),
+            expire_after: Some(300),
             comment: Some("test comment".to_string()),
             // ignore query parse result
             query: create_task.query.clone(),
         };
         assert_eq!(create_task, &expected);
 
-        // create flow without `OR REPLACE`, `IF NOT EXISTS`, `EXPIRE WHEN` and `COMMENT`
+        // create flow without `OR REPLACE`, `IF NOT EXISTS`, `EXPIRE AFTER` and `COMMENT`
         let sql = r"
 CREATE FLOW task_2
 SINK TO schema_1.table_1
@@ -1123,7 +1174,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
         };
         assert!(!create_task.or_replace);
         assert!(!create_task.if_not_exists);
-        assert!(create_task.expire_when.is_none());
+        assert!(create_task.expire_after.is_none());
         assert!(create_task.comment.is_none());
     }
 
@@ -1301,16 +1352,10 @@ ENGINE=mito";
             assert_eq!(c.constraints.len(), 2);
             let tc = c.constraints[0].clone();
             match tc {
-                TableConstraint::Unique {
-                    name,
-                    columns,
-                    is_primary,
-                    ..
-                } => {
+                TableConstraint::Unique { name, columns, .. } => {
                     assert_eq!(name.unwrap().to_string(), "__time_index");
                     assert_eq!(columns.len(), 1);
                     assert_eq!(&columns[0].value, "ts");
-                    assert!(!is_primary);
                 }
                 _ => panic!("should be time index constraint"),
             };
@@ -1508,16 +1553,10 @@ ENGINE=mito";
         if let Statement::CreateTable(c) = &result[0] {
             let tc = c.constraints[0].clone();
             match tc {
-                TableConstraint::Unique {
-                    name,
-                    columns,
-                    is_primary,
-                    ..
-                } => {
+                TableConstraint::Unique { name, columns, .. } => {
                     assert_eq!(name.unwrap().to_string(), "__time_index");
                     assert_eq!(columns.len(), 1);
                     assert_eq!(&columns[0].value, "ts");
-                    assert!(!is_primary);
                 }
                 _ => panic!("should be time index constraint"),
             }
@@ -1624,20 +1663,11 @@ ENGINE=mito";
                 assert_column_def(&columns[3], "memory", "FLOAT64");
 
                 let constraints = &c.constraints;
-                assert_matches!(
-                    &constraints[0],
-                    TableConstraint::Unique {
-                        is_primary: false,
+                assert!(matches!(&constraints[0], TableConstraint::Unique {
+                        name: Some(name),
                         ..
-                    }
-                );
-                assert_matches!(
-                    &constraints[1],
-                    TableConstraint::Unique {
-                        is_primary: true,
-                        ..
-                    }
-                );
+                    }  if name.value == TIME_INDEX));
+                assert_matches!(&constraints[1], TableConstraint::PrimaryKey { .. });
                 assert_eq!(1, c.options.len());
                 assert_eq!(
                     [("ttl", "10s")].into_iter().collect::<HashMap<_, _>>(),
@@ -1731,5 +1761,47 @@ non TIMESTAMP(6) TIME INDEX,
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_parse_create_view() {
+        let sql = "CREATE VIEW test AS SELECT * FROM NUMBERS";
+
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), sql);
+                assert!(!c.or_replace);
+                assert!(!c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "CREATE OR REPLACE VIEW IF NOT EXISTS test AS SELECT * FROM NUMBERS";
+
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        match &result[0] {
+            Statement::CreateView(c) => {
+                assert_eq!(c.to_string(), sql);
+                assert!(c.or_replace);
+                assert!(c.if_not_exists);
+                assert_eq!("test", c.name.to_string());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_view_invalid_query() {
+        let sql = "CREATE VIEW test AS DELETE from demo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+        assert_matches!(result, Err(crate::error::Error::Syntax { .. }));
     }
 }

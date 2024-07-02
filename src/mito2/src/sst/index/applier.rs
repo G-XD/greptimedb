@@ -28,8 +28,8 @@ use store_api::storage::RegionId;
 
 use crate::cache::file_cache::{FileCacheRef, FileType, IndexKey};
 use crate::error::{
-    ApplyIndexSnafu, PuffinBlobTypeNotFoundSnafu, PuffinReadBlobSnafu, PuffinReadMetadataSnafu,
-    Result,
+    ApplyIndexSnafu, OpenDalSnafu, PuffinBlobTypeNotFoundSnafu, PuffinReadBlobSnafu,
+    PuffinReadMetadataSnafu, Result,
 };
 use crate::metrics::{
     INDEX_APPLY_ELAPSED, INDEX_APPLY_MEMORY_USAGE, INDEX_PUFFIN_READ_BYTES_TOTAL,
@@ -121,10 +121,26 @@ impl SstIndexApplier {
             return Ok(None);
         };
 
-        Ok(file_cache
+        let Some(indexed_value) = file_cache
+            .get(IndexKey::new(self.region_id, file_id, FileType::Puffin))
+            .await
+        else {
+            return Ok(None);
+        };
+
+        let Some(reader) = file_cache
             .reader(IndexKey::new(self.region_id, file_id, FileType::Puffin))
             .await
-            .map(PuffinFileReader::new))
+        else {
+            return Ok(None);
+        };
+
+        let reader = reader
+            .into_futures_async_read(0..indexed_value.file_size as u64)
+            .await
+            .context(OpenDalSnafu)?;
+
+        Ok(Some(PuffinFileReader::new(reader)))
     }
 
     /// Helper function to create a [`PuffinFileReader`] from the remote index file.
@@ -190,12 +206,19 @@ mod tests {
         let region_dir = "region_dir".to_string();
         let path = location::index_file_path(&region_dir, file_id);
 
-        let mut puffin_writer = PuffinFileWriter::new(object_store.writer(&path).await.unwrap());
+        let mut puffin_writer = PuffinFileWriter::new(
+            object_store
+                .writer(&path)
+                .await
+                .unwrap()
+                .into_futures_async_write(),
+        );
         puffin_writer
             .add_blob(Blob {
                 blob_type: INDEX_BLOB_TYPE.to_string(),
-                data: Cursor::new(vec![]),
+                compressed_data: Cursor::new(vec![]),
                 properties: Default::default(),
+                compression_codec: None,
             })
             .await
             .unwrap();
@@ -236,12 +259,19 @@ mod tests {
         let region_dir = "region_dir".to_string();
         let path = location::index_file_path(&region_dir, file_id);
 
-        let mut puffin_writer = PuffinFileWriter::new(object_store.writer(&path).await.unwrap());
+        let mut puffin_writer = PuffinFileWriter::new(
+            object_store
+                .writer(&path)
+                .await
+                .unwrap()
+                .into_futures_async_write(),
+        );
         puffin_writer
             .add_blob(Blob {
                 blob_type: "invalid_blob_type".to_string(),
-                data: Cursor::new(vec![]),
+                compressed_data: Cursor::new(vec![]),
                 properties: Default::default(),
+                compression_codec: None,
             })
             .await
             .unwrap();

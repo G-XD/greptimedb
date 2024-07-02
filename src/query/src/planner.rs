@@ -24,7 +24,6 @@ use datafusion::execution::context::SessionState;
 use datafusion::sql::planner::PlannerContext;
 use datafusion_expr::Expr as DfExpr;
 use datafusion_sql::planner::{ParserOptions, SqlToRel};
-use promql::planner::PromPlanner;
 use promql_parser::parser::EvalStmt;
 use session::context::QueryContextRef;
 use snafu::ResultExt;
@@ -34,13 +33,16 @@ use sql::statements::statement::Statement;
 use crate::error::{DataFusionSnafu, PlanSqlSnafu, QueryPlanSnafu, Result, SqlSnafu};
 use crate::parser::QueryStatement;
 use crate::plan::LogicalPlan;
-use crate::query_engine::QueryEngineState;
+use crate::promql::planner::PromPlanner;
+use crate::query_engine::{DefaultPlanDecoder, QueryEngineState};
 use crate::range_select::plan_rewrite::RangePlanRewriter;
 use crate::{DfContextProviderAdapter, QueryEngineContext};
 
 #[async_trait]
 pub trait LogicalPlanner: Send + Sync {
     async fn plan(&self, stmt: QueryStatement, query_ctx: QueryContextRef) -> Result<LogicalPlan>;
+
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan>;
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -67,6 +69,10 @@ impl DfLogicalPlanner {
             self.engine_state.catalog_manager().clone(),
             self.engine_state.disallow_cross_catalog_query(),
             query_ctx.as_ref(),
+            Arc::new(DefaultPlanDecoder::new(
+                self.session_state.clone(),
+                &query_ctx,
+            )?),
         );
 
         let context_provider = DfContextProviderAdapter::try_new(
@@ -138,12 +144,24 @@ impl DfLogicalPlanner {
             self.engine_state.catalog_manager().clone(),
             self.engine_state.disallow_cross_catalog_query(),
             query_ctx.as_ref(),
+            Arc::new(DefaultPlanDecoder::new(
+                self.session_state.clone(),
+                &query_ctx,
+            )?),
         );
-        PromPlanner::stmt_to_plan(table_provider, stmt)
+        PromPlanner::stmt_to_plan(table_provider, stmt, &self.session_state)
             .await
             .map(LogicalPlan::DfPlan)
             .map_err(BoxedError::new)
             .context(QueryPlanSnafu)
+    }
+
+    #[tracing::instrument(skip_all)]
+    fn optimize_logical_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.engine_state
+            .optimize_logical_plan(plan.unwrap_df_plan())
+            .context(DataFusionSnafu)
+            .map(Into::into)
     }
 }
 
@@ -155,6 +173,10 @@ impl LogicalPlanner for DfLogicalPlanner {
             QueryStatement::Sql(stmt) => self.plan_sql(stmt, query_ctx).await,
             QueryStatement::Promql(stmt) => self.plan_pql(stmt, query_ctx).await,
         }
+    }
+
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.optimize_logical_plan(plan)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -19,6 +19,7 @@ workspace = true
 async-trait.workspace = true
 auth.workspace = true
 base64.workspace = true
+cache.workspace = true
 catalog.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -27,6 +28,7 @@ common-base.workspace = true
 common-catalog.workspace = true
 common-config.workspace = true
 common-error.workspace = true
+common-grpc.workspace = true
 common-macro.workspace = true
 common-meta.workspace = true
 common-procedure.workspace = true
@@ -39,12 +41,12 @@ common-telemetry = { workspace = true, features = [
 common-time.workspace = true
 common-version.workspace = true
 common-wal.workspace = true
-config = "0.13"
 datanode.workspace = true
 datatypes.workspace = true
 either = "1.8"
 etcd-client.workspace = true
 file-engine.workspace = true
+flow.workspace = true
 frontend.workspace = true
 futures.workspace = true
 human-panic = "1.2.2"
@@ -52,6 +54,7 @@ lazy_static.workspace = true
 meta-client.workspace = true
 meta-srv.workspace = true
 mito2.workspace = true
+moka.workspace = true
 nu-ansi-term = "0.46"
 plugins.workspace = true
 prometheus.workspace = true
@@ -71,11 +74,13 @@ substrait.workspace = true
 table.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing-appender = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = "0.5"
 
 [dev-dependencies]
+client = { workspace = true, features = ["testing"] }
 common-test-util.workspace = true
 serde.workspace = true
 temp-env = "0.3"

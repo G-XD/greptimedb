@@ -13,22 +13,21 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use snafu::OptionExt;
 use table::metadata::TableId;
+use table::table_name::TableName;
 
 use crate::error::{self, Result};
 use crate::key::flow::FlowScoped;
 use crate::key::txn_helper::TxnOpGetResponseSet;
-use crate::key::{
-    txn_helper, DeserializedValueWithBytes, FlowId, FlowPartitionId, MetaKey, TableMetaValue,
-};
+use crate::key::{DeserializedValueWithBytes, FlowId, FlowPartitionId, MetaKey, TableMetaValue};
 use crate::kv_backend::txn::Txn;
 use crate::kv_backend::KvBackendRef;
-use crate::table_name::TableName;
 use crate::FlownodeId;
 
 const FLOW_INFO_KEY_PREFIX: &str = "info";
@@ -124,7 +123,8 @@ pub struct FlowInfoValue {
     /// The raw sql.
     pub(crate) raw_sql: String,
     /// The expr of expire.
-    pub(crate) expire_when: String,
+    /// Duration in seconds as `i64`.
+    pub(crate) expire_after: Option<i64>,
     /// The comment.
     pub(crate) comment: String,
     /// The options.
@@ -141,7 +141,29 @@ impl FlowInfoValue {
     pub fn source_table_ids(&self) -> &[TableId] {
         &self.source_table_ids
     }
+
+    pub fn flow_name(&self) -> &String {
+        &self.flow_name
+    }
+
+    pub fn sink_table_name(&self) -> &TableName {
+        &self.sink_table_name
+    }
+
+    pub fn raw_sql(&self) -> &String {
+        &self.raw_sql
+    }
+
+    pub fn expire_after(&self) -> Option<i64> {
+        self.expire_after
+    }
+
+    pub fn comment(&self) -> &String {
+        &self.comment
+    }
 }
+
+pub type FlowInfoManagerRef = Arc<FlowInfoManager>;
 
 /// The manager of [FlowInfoKey].
 pub struct FlowInfoManager {
@@ -178,7 +200,7 @@ impl FlowInfoManager {
         ) -> Result<Option<DeserializedValueWithBytes<FlowInfoValue>>>,
     )> {
         let key = FlowInfoKey::new(flow_id).to_bytes();
-        let txn = txn_helper::build_put_if_absent_txn(key.clone(), flow_value.try_as_raw_value()?);
+        let txn = Txn::put_if_not_exists(key.clone(), flow_value.try_as_raw_value()?);
 
         Ok((
             txn,

@@ -31,7 +31,7 @@ use common_base::readable_size::ReadableSize;
 use common_base::Plugins;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatch;
-use common_telemetry::logging::{error, info};
+use common_telemetry::{error, info};
 use common_time::timestamp::TimeUnit;
 use common_time::Timestamp;
 use datatypes::data_type::DataType;
@@ -67,12 +67,13 @@ use crate::metrics_handler::MetricsHandler;
 use crate::prometheus_handler::PrometheusHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
-    InfluxdbLineProtocolHandlerRef, OpenTelemetryProtocolHandlerRef, OpentsdbProtocolHandlerRef,
-    PromStoreProtocolHandlerRef, ScriptHandlerRef,
+    InfluxdbLineProtocolHandlerRef, LogHandlerRef, OpenTelemetryProtocolHandlerRef,
+    OpentsdbProtocolHandlerRef, PromStoreProtocolHandlerRef, ScriptHandlerRef,
 };
 use crate::server::Server;
 
 pub mod authorize;
+pub mod event;
 pub mod handler;
 pub mod header;
 pub mod influxdb;
@@ -190,6 +191,10 @@ impl From<SchemaRef> for OutputSchema {
 pub struct HttpRecordsOutput {
     schema: OutputSchema,
     rows: Vec<Vec<Value>>,
+    // total_rows is equal to rows.len() in most cases,
+    // the Dashboard query result may be truncated, so we need to return the total_rows.
+    #[serde(default)]
+    total_rows: usize,
 
     // plan level execution metrics
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -216,7 +221,7 @@ impl HttpRecordsOutput {
 }
 
 impl HttpRecordsOutput {
-    pub(crate) fn try_new(
+    pub fn try_new(
         schema: SchemaRef,
         recordbatches: Vec<RecordBatch>,
     ) -> std::result::Result<HttpRecordsOutput, Error> {
@@ -224,26 +229,29 @@ impl HttpRecordsOutput {
             Ok(HttpRecordsOutput {
                 schema: OutputSchema::from(schema),
                 rows: vec![],
+                total_rows: 0,
                 metrics: Default::default(),
             })
         } else {
-            let mut rows =
-                Vec::with_capacity(recordbatches.iter().map(|r| r.num_rows()).sum::<usize>());
+            let num_rows = recordbatches.iter().map(|r| r.num_rows()).sum::<usize>();
+            let mut rows = Vec::with_capacity(num_rows);
+            let num_cols = schema.column_schemas().len();
+            rows.resize_with(num_rows, || Vec::with_capacity(num_cols));
 
+            let mut finished_row_cursor = 0;
             for recordbatch in recordbatches {
-                for row in recordbatch.rows() {
-                    let value_row = row
-                        .into_iter()
-                        .map(Value::try_from)
-                        .collect::<std::result::Result<Vec<Value>, _>>()
-                        .context(ToJsonSnafu)?;
-
-                    rows.push(value_row);
+                for col in recordbatch.columns() {
+                    for row_idx in 0..recordbatch.num_rows() {
+                        let value = Value::try_from(col.get_ref(row_idx)).context(ToJsonSnafu)?;
+                        rows[row_idx + finished_row_cursor].push(value);
+                    }
                 }
+                finished_row_cursor += recordbatch.num_rows();
             }
 
             Ok(HttpRecordsOutput {
                 schema: OutputSchema::from(schema),
+                total_rows: rows.len(),
                 rows,
                 metrics: Default::default(),
             })
@@ -357,6 +365,34 @@ impl HttpResponse {
             HttpResponse::Error(resp) => resp.with_execution_time(execution_time).into(),
         }
     }
+
+    pub fn with_limit(self, limit: usize) -> Self {
+        match self {
+            HttpResponse::Csv(resp) => resp.with_limit(limit).into(),
+            HttpResponse::Table(resp) => resp.with_limit(limit).into(),
+            HttpResponse::GreptimedbV1(resp) => resp.with_limit(limit).into(),
+            _ => self,
+        }
+    }
+}
+
+pub fn process_with_limit(
+    mut outputs: Vec<GreptimeQueryOutput>,
+    limit: usize,
+) -> Vec<GreptimeQueryOutput> {
+    outputs
+        .drain(..)
+        .map(|data| match data {
+            GreptimeQueryOutput::Records(mut records) => {
+                if records.rows.len() > limit {
+                    records.rows.truncate(limit);
+                    records.total_rows = limit;
+                }
+                GreptimeQueryOutput::Records(records)
+            }
+            _ => data,
+        })
+        .collect()
 }
 
 impl IntoResponse for HttpResponse {
@@ -553,6 +589,16 @@ impl HttpServerBuilder {
         }
     }
 
+    pub fn with_log_ingest_handler(self, handler: LogHandlerRef) -> Self {
+        Self {
+            router: self.router.nest(
+                &format!("/{HTTP_API_VERSION}/events"),
+                HttpServer::route_log(handler),
+            ),
+            ..self
+        }
+    }
+
     pub fn with_plugins(self, plugins: Plugins) -> Self {
         Self { plugins, ..self }
     }
@@ -624,20 +670,30 @@ impl HttpServer {
     }
 
     pub fn build(&self, router: Router) -> Router {
+        let timeout_layer = if self.options.timeout != Duration::default() {
+            Some(ServiceBuilder::new().layer(TimeoutLayer::new(self.options.timeout)))
+        } else {
+            info!("HTTP server timeout is disabled");
+            None
+        };
+        let body_limit_layer = if self.options.body_limit != ReadableSize(0) {
+            Some(
+                ServiceBuilder::new()
+                    .layer(DefaultBodyLimit::max(self.options.body_limit.0 as usize)),
+            )
+        } else {
+            info!("HTTP server body limit is disabled");
+            None
+        };
+
         router
             // middlewares
             .layer(
                 ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(handle_error))
                     .layer(TraceLayer::new_for_http())
-                    .layer(TimeoutLayer::new(self.options.timeout))
-                    .layer(DefaultBodyLimit::max(
-                        self.options
-                            .body_limit
-                            .0
-                            .try_into()
-                            .unwrap_or_else(|_| DEFAULT_BODY_LIMIT.as_bytes() as usize),
-                    ))
+                    .option_layer(timeout_layer)
+                    .option_layer(body_limit_layer)
                     // auth layer
                     .layer(middleware::from_fn_with_state(
                         AuthState::new(self.user_provider.clone()),
@@ -663,6 +719,21 @@ impl HttpServer {
         Router::new()
             .route("/metrics", routing::get(handler::metrics))
             .with_state(metrics_handler)
+    }
+
+    fn route_log<S>(log_handler: LogHandlerRef) -> Router<S> {
+        Router::new()
+            .route("/logs", routing::post(event::log_ingester))
+            .route(
+                "/pipelines/:pipeline_name",
+                routing::post(event::add_pipeline),
+            )
+            .layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(handle_error))
+                    .layer(RequestDecompressionLayer::new()),
+            )
+            .with_state(log_handler)
     }
 
     fn route_sql<S>(api_state: ApiState) -> ApiRouter<S> {
@@ -808,6 +879,13 @@ impl Server for HttpServer {
             let app = self.build(app);
             let server = axum::Server::bind(&listening)
                 .tcp_nodelay(true)
+                // Enable TCP keepalive to close the dangling established connections.
+                // It's configured to let the keepalive probes first send after the connection sits
+                // idle for 59 minutes, and then send every 10 seconds for 6 times.
+                // So the connection will be closed after roughly 1 hour.
+                .tcp_keepalive(Some(Duration::from_secs(59 * 60)))
+                .tcp_keepalive_interval(Some(Duration::from_secs(10)))
+                .tcp_keepalive_retries(Some(6))
                 .serve(app.into_make_service());
 
             *shutdown_tx = Some(tx);

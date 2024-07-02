@@ -29,7 +29,6 @@ use common_meta::key::datanode_table::DatanodeTableKey;
 use common_meta::key::{TableMetadataManagerRef, MAINTENANCE_KEY};
 use common_meta::kv_backend::{KvBackendRef, ResettableKvBackendRef};
 use common_meta::lock_key::{CatalogLock, RegionLock, SchemaLock, TableLock};
-use common_meta::table_name::TableName;
 use common_meta::{ClusterId, RegionIdent};
 use common_procedure::error::{
     Error as ProcedureError, FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu,
@@ -44,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use store_api::storage::{RegionId, RegionNumber};
 use table::metadata::TableId;
+use table::table_name::TableName;
 
 use crate::error::{
     self, KvBackendSnafu, RegisterProcedureLoaderSnafu, Result, TableMetadataManagerSnafu,
@@ -574,6 +574,7 @@ mod tests {
             });
             let selector_ctx = SelectorContext {
                 datanode_lease_secs: 10,
+                flownode_lease_secs: 10,
                 server_addr: "127.0.0.1:3002".to_string(),
                 kv_backend: kv_backend.clone(),
                 meta_peer_client,

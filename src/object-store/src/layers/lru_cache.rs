@@ -14,25 +14,24 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use opendal::raw::oio::Read;
+use opendal::raw::oio::Reader;
 use opendal::raw::{
-    Accessor, Layer, LayeredAccessor, OpDelete, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead,
+    Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead,
     RpWrite,
 };
 use opendal::Result;
 mod read_cache;
-use common_telemetry::logging::info;
+use common_telemetry::info;
 use read_cache::ReadCache;
 
 /// An opendal layer with local LRU file cache supporting.
 #[derive(Clone)]
-pub struct LruCacheLayer<C: Clone> {
+pub struct LruCacheLayer<C: Access> {
     // The read cache
     read_cache: ReadCache<C>,
 }
 
-impl<C: Accessor + Clone> LruCacheLayer<C> {
+impl<C: Access> LruCacheLayer<C> {
     /// Create a `[LruCacheLayer]` with local file cache and capacity in bytes.
     pub async fn new(file_cache: Arc<C>, capacity: usize) -> Result<Self> {
         let read_cache = ReadCache::new(file_cache, capacity);
@@ -53,15 +52,15 @@ impl<C: Accessor + Clone> LruCacheLayer<C> {
 
     /// Returns the read cache statistics info `(EntryCount, SizeInBytes)`.
     pub async fn read_cache_stat(&self) -> (u64, u64) {
-        self.read_cache.stat().await
+        self.read_cache.cache_stat().await
     }
 }
 
-impl<I: Accessor, C: Accessor + Clone> Layer<I> for LruCacheLayer<C> {
-    type LayeredAccessor = LruCacheAccessor<I, C>;
+impl<I: Access, C: Access> Layer<I> for LruCacheLayer<C> {
+    type LayeredAccess = LruCacheAccess<I, C>;
 
-    fn layer(&self, inner: I) -> Self::LayeredAccessor {
-        LruCacheAccessor {
+    fn layer(&self, inner: I) -> Self::LayeredAccess {
+        LruCacheAccess {
             inner,
             read_cache: self.read_cache.clone(),
         }
@@ -69,15 +68,14 @@ impl<I: Accessor, C: Accessor + Clone> Layer<I> for LruCacheLayer<C> {
 }
 
 #[derive(Debug)]
-pub struct LruCacheAccessor<I, C: Clone> {
+pub struct LruCacheAccess<I, C> {
     inner: I,
     read_cache: ReadCache<C>,
 }
 
-#[async_trait]
-impl<I: Accessor, C: Accessor + Clone> LayeredAccessor for LruCacheAccessor<I, C> {
+impl<I: Access, C: Access> LayeredAccess for LruCacheAccess<I, C> {
     type Inner = I;
-    type Reader = Box<dyn Read>;
+    type Reader = Reader;
     type BlockingReader = I::BlockingReader;
     type Writer = I::Writer;
     type BlockingWriter = I::BlockingWriter;
@@ -89,7 +87,9 @@ impl<I: Accessor, C: Accessor + Clone> LayeredAccessor for LruCacheAccessor<I, C
     }
 
     async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
-        self.read_cache.read(&self.inner, path, args).await
+        self.read_cache
+            .read_from_cache(&self.inner, path, args)
+            .await
     }
 
     async fn write(&self, path: &str, args: OpWrite) -> Result<(RpWrite, Self::Writer)> {

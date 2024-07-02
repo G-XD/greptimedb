@@ -21,20 +21,30 @@ use serde_json::error::Error as JsonError;
 use snafu::{Location, Snafu};
 use store_api::storage::RegionId;
 
-use crate::kafka::NamespaceImpl as KafkaNamespace;
+use crate::kafka::producer::ProduceRequest;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
 #[stack_trace_debug]
 pub enum Error {
+    #[snafu(display("Invalid provider type, expected: {}, actual: {}", expected, actual))]
+    InvalidProvider {
+        #[snafu(implicit)]
+        location: Location,
+        expected: String,
+        actual: String,
+    },
+
     #[snafu(display("Failed to start log store gc task"))]
     StartGcTask {
+        #[snafu(implicit)]
         location: Location,
         source: RuntimeError,
     },
 
     #[snafu(display("Failed to stop log store gc task"))]
     StopGcTask {
+        #[snafu(implicit)]
         location: Location,
         source: RuntimeError,
     },
@@ -43,6 +53,7 @@ pub enum Error {
     AddEntryLogBatch {
         #[snafu(source)]
         error: raft_engine::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -50,6 +61,7 @@ pub enum Error {
     RaftEngine {
         #[snafu(source)]
         error: raft_engine::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -58,14 +70,22 @@ pub enum Error {
         path: String,
         #[snafu(source)]
         error: std::io::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Log store not started yet"))]
-    IllegalState { location: Location },
+    IllegalState {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Namespace is illegal: {}", ns))]
-    IllegalNamespace { ns: u64, location: Location },
+    IllegalNamespace {
+        ns: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display(
         "Failed to fetch entries from namespace: {}, start: {}, end: {}, max size: {}",
@@ -81,6 +101,7 @@ pub enum Error {
         max_size: usize,
         #[snafu(source)]
         error: raft_engine::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -94,6 +115,7 @@ pub enum Error {
         namespace: u64,
         first_index: u64,
         attempt_index: u64,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -103,9 +125,16 @@ pub enum Error {
     ))]
     BuildClient {
         broker_endpoints: Vec<String>,
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display("Failed to found client"))]
+    ClientNotFount {
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display("Failed to resolve Kafka broker endpoint."))]
@@ -119,6 +148,7 @@ pub enum Error {
     BuildPartitionClient {
         topic: String,
         partition: i32,
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: rskafka::client::error::Error,
@@ -131,55 +161,74 @@ pub enum Error {
     ))]
     GetClient {
         topic: String,
+        #[snafu(implicit)]
         location: Location,
         error: String,
     },
 
     #[snafu(display("Missing required key in a record"))]
-    MissingKey { location: Location },
+    MissingKey {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Missing required value in a record"))]
-    MissingValue { location: Location },
+    MissingValue {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Cannot build a record from empty entries"))]
-    EmptyEntries { location: Location },
+    EmptyEntries {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
-    #[snafu(display(
-        "Failed to produce records to Kafka, topic: {}, size: {}, limit: {}",
-        topic,
-        size,
-        limit,
-    ))]
+    #[snafu(display("Failed to produce records to Kafka, topic: {}, size: {}", topic, size))]
     ProduceRecord {
         topic: String,
         size: usize,
-        limit: usize,
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: rskafka::client::producer::Error,
     },
 
-    #[snafu(display("Failed to read a record from Kafka, ns: {}", ns))]
-    ConsumeRecord {
-        ns: KafkaNamespace,
+    #[snafu(display("Failed to produce batch records to Kafka"))]
+    BatchProduce {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: rskafka::client::error::Error,
     },
 
-    #[snafu(display("Failed to get the latest offset, ns: {}", ns))]
+    #[snafu(display("Failed to read a record from Kafka, topic: {}", topic))]
+    ConsumeRecord {
+        topic: String,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display("Failed to get the latest offset, topic: {}", topic))]
     GetOffset {
-        ns: KafkaNamespace,
+        topic: String,
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: rskafka::client::error::Error,
     },
 
     #[snafu(display("Failed to do a cast"))]
-    Cast { location: Location },
+    Cast {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to encode object into json"))]
     EncodeJson {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: JsonError,
@@ -187,13 +236,18 @@ pub enum Error {
 
     #[snafu(display("Failed to decode object from json"))]
     DecodeJson {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: JsonError,
     },
 
     #[snafu(display("The record sequence is not legal, error: {}", error))]
-    IllegalSequence { location: Location, error: String },
+    IllegalSequence {
+        #[snafu(implicit)]
+        location: Location,
+        error: String,
+    },
 
     #[snafu(display(
         "Attempt to append discontinuous log entry, region: {}, last index: {}, attempt index: {}",
@@ -205,6 +259,40 @@ pub enum Error {
         region_id: RegionId,
         last_index: u64,
         attempt_index: u64,
+    },
+
+    #[snafu(display("Failed to send produce request"))]
+    SendProduceRequest {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: tokio::sync::mpsc::error::SendError<ProduceRequest>,
+    },
+
+    #[snafu(display("Failed to send produce request"))]
+    WaitProduceResultReceiver {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: tokio::sync::oneshot::error::RecvError,
+    },
+
+    #[snafu(display(
+        "The length of meta if exceeded the limit: {}, actual: {}",
+        limit,
+        actual
+    ))]
+    MetaLengthExceededLimit {
+        #[snafu(implicit)]
+        location: Location,
+        limit: usize,
+        actual: usize,
+    },
+
+    #[snafu(display("No max value"))]
+    NoMaxValue {
+        #[snafu(implicit)]
+        location: Location,
     },
 }
 

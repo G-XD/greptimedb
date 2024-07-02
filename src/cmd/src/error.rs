@@ -17,7 +17,6 @@ use std::any::Any;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
-use config::ConfigError;
 use rustyline::error::ReadlineError;
 use snafu::{Location, Snafu};
 
@@ -27,97 +26,134 @@ use snafu::{Location, Snafu};
 pub enum Error {
     #[snafu(display("Failed to create default catalog and schema"))]
     InitMetadata {
+        #[snafu(implicit)]
         location: Location,
         source: common_meta::error::Error,
     },
 
     #[snafu(display("Failed to iter stream"))]
     IterStream {
+        #[snafu(implicit)]
         location: Location,
         source: common_meta::error::Error,
     },
 
     #[snafu(display("Failed to init DDL manager"))]
     InitDdlManager {
+        #[snafu(implicit)]
         location: Location,
         source: common_meta::error::Error,
     },
 
     #[snafu(display("Failed to init default timezone"))]
     InitTimezone {
+        #[snafu(implicit)]
         location: Location,
         source: common_time::error::Error,
     },
 
     #[snafu(display("Failed to start procedure manager"))]
     StartProcedureManager {
+        #[snafu(implicit)]
         location: Location,
         source: common_procedure::error::Error,
     },
 
     #[snafu(display("Failed to stop procedure manager"))]
     StopProcedureManager {
+        #[snafu(implicit)]
         location: Location,
         source: common_procedure::error::Error,
     },
 
     #[snafu(display("Failed to start wal options allocator"))]
     StartWalOptionsAllocator {
+        #[snafu(implicit)]
         location: Location,
         source: common_meta::error::Error,
     },
 
     #[snafu(display("Failed to start datanode"))]
     StartDatanode {
+        #[snafu(implicit)]
         location: Location,
         source: datanode::error::Error,
     },
 
     #[snafu(display("Failed to shutdown datanode"))]
     ShutdownDatanode {
+        #[snafu(implicit)]
         location: Location,
         source: datanode::error::Error,
     },
 
+    #[snafu(display("Failed to start flownode"))]
+    StartFlownode {
+        #[snafu(implicit)]
+        location: Location,
+        source: flow::Error,
+    },
+
+    #[snafu(display("Failed to shutdown flownode"))]
+    ShutdownFlownode {
+        #[snafu(implicit)]
+        location: Location,
+        source: flow::Error,
+    },
+
     #[snafu(display("Failed to start frontend"))]
     StartFrontend {
+        #[snafu(implicit)]
         location: Location,
         source: frontend::error::Error,
     },
 
     #[snafu(display("Failed to shutdown frontend"))]
     ShutdownFrontend {
+        #[snafu(implicit)]
         location: Location,
         source: frontend::error::Error,
     },
 
     #[snafu(display("Failed to build meta server"))]
     BuildMetaServer {
+        #[snafu(implicit)]
         location: Location,
         source: meta_srv::error::Error,
     },
 
     #[snafu(display("Failed to start meta server"))]
     StartMetaServer {
+        #[snafu(implicit)]
         location: Location,
         source: meta_srv::error::Error,
     },
 
     #[snafu(display("Failed to shutdown meta server"))]
     ShutdownMetaServer {
+        #[snafu(implicit)]
         location: Location,
         source: meta_srv::error::Error,
     },
 
     #[snafu(display("Missing config, msg: {}", msg))]
-    MissingConfig { msg: String, location: Location },
+    MissingConfig {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Illegal config: {}", msg))]
-    IllegalConfig { msg: String, location: Location },
+    IllegalConfig {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Unsupported selector type: {}", selector_type))]
     UnsupportedSelectorType {
         selector_type: String,
+        #[snafu(implicit)]
         location: Location,
         source: meta_srv::error::Error,
     },
@@ -129,6 +165,7 @@ pub enum Error {
     ReplCreation {
         #[snafu(source)]
         error: ReadlineError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -136,23 +173,36 @@ pub enum Error {
     Readline {
         #[snafu(source)]
         error: ReadlineError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to request database, sql: {sql}"))]
+    RequestDatabase {
+        sql: String,
+        #[snafu(source)]
+        source: client::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to collect RecordBatches"))]
     CollectRecordBatches {
+        #[snafu(implicit)]
         location: Location,
         source: common_recordbatch::error::Error,
     },
 
     #[snafu(display("Failed to pretty print Recordbatches"))]
     PrettyPrintRecordBatches {
+        #[snafu(implicit)]
         location: Location,
         source: common_recordbatch::error::Error,
     },
 
     #[snafu(display("Failed to start Meta client"))]
     StartMetaClient {
+        #[snafu(implicit)]
         location: Location,
         source: meta_client::error::Error,
     },
@@ -160,31 +210,36 @@ pub enum Error {
     #[snafu(display("Failed to parse SQL: {}", sql))]
     ParseSql {
         sql: String,
+        #[snafu(implicit)]
         location: Location,
         source: query::error::Error,
     },
 
     #[snafu(display("Failed to plan statement"))]
     PlanStatement {
+        #[snafu(implicit)]
         location: Location,
         source: query::error::Error,
     },
 
     #[snafu(display("Failed to encode logical plan in substrait"))]
     SubstraitEncodeLogicalPlan {
+        #[snafu(implicit)]
         location: Location,
         source: substrait::error::Error,
     },
 
     #[snafu(display("Failed to load layered config"))]
     LoadLayeredConfig {
-        #[snafu(source)]
-        error: ConfigError,
+        #[snafu(source(from(common_config::error::Error, Box::new)))]
+        source: Box<common_config::error::Error>,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to start catalog manager"))]
     StartCatalogManager {
+        #[snafu(implicit)]
         location: Location,
         source: catalog::error::Error,
     },
@@ -194,6 +249,7 @@ pub enum Error {
         etcd_addr: String,
         #[snafu(source)]
         error: etcd_client::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -201,6 +257,7 @@ pub enum Error {
     ConnectServer {
         addr: String,
         source: client::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -208,6 +265,7 @@ pub enum Error {
     SerdeJson {
         #[snafu(source)]
         error: serde_json::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -216,17 +274,25 @@ pub enum Error {
         reason: String,
         #[snafu(source)]
         error: reqwest::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Expect data from output, but got another thing"))]
-    NotDataFromOutput { location: Location },
+    NotDataFromOutput {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Empty result from output"))]
-    EmptyResult { location: Location },
+    EmptyResult {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to manipulate file"))]
     FileIo {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: std::io::Error,
@@ -234,6 +300,7 @@ pub enum Error {
 
     #[snafu(display("Invalid database name: {}", database))]
     InvalidDatabaseName {
+        #[snafu(implicit)]
         location: Location,
         database: String,
     },
@@ -248,13 +315,29 @@ pub enum Error {
     #[snafu(display("Other error"))]
     Other {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to build runtime"))]
     BuildRuntime {
+        #[snafu(implicit)]
         location: Location,
         source: common_runtime::error::Error,
+    },
+
+    #[snafu(display("Failed to get cache from cache registry: {}", name))]
+    CacheRequired {
+        #[snafu(implicit)]
+        location: Location,
+        name: String,
+    },
+
+    #[snafu(display("Failed to build cache registry"))]
+    BuildCacheRegistry {
+        #[snafu(implicit)]
+        location: Location,
+        source: cache::error::Error,
     },
 }
 
@@ -294,6 +377,7 @@ impl ErrorExt for Error {
             Error::ReplCreation { .. } | Error::Readline { .. } | Error::HttpQuerySql { .. } => {
                 StatusCode::Internal
             }
+            Error::RequestDatabase { source, .. } => source.status_code(),
             Error::CollectRecordBatches { source, .. }
             | Error::PrettyPrintRecordBatches { source, .. } => source.status_code(),
             Error::StartMetaClient { source, .. } => source.status_code(),
@@ -308,6 +392,11 @@ impl ErrorExt for Error {
             Error::Other { source, .. } => source.status_code(),
 
             Error::BuildRuntime { source, .. } => source.status_code(),
+
+            Error::CacheRequired { .. } | Error::BuildCacheRegistry { .. } => StatusCode::Internal,
+            Self::StartFlownode { source, .. } | Self::ShutdownFlownode { source, .. } => {
+                source.status_code()
+            }
         }
     }
 

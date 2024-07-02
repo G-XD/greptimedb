@@ -17,8 +17,8 @@ use sqlparser::dialect::keywords::Keyword;
 use sqlparser::tokenizer::Token;
 
 use crate::error::{self, InvalidTableNameSnafu, Result};
-use crate::parser::ParserContext;
-use crate::statements::drop::{DropDatabase, DropTable};
+use crate::parser::{ParserContext, FLOW};
+use crate::statements::drop::{DropDatabase, DropFlow, DropTable};
 use crate::statements::statement::Statement;
 
 /// DROP statement parser implementation
@@ -29,32 +29,68 @@ impl<'a> ParserContext<'a> {
             Token::Word(w) => match w.keyword {
                 Keyword::TABLE => self.parse_drop_table(),
                 Keyword::SCHEMA | Keyword::DATABASE => self.parse_drop_database(),
+                Keyword::NoKeyword => {
+                    let uppercase = w.value.to_uppercase();
+                    match uppercase.as_str() {
+                        FLOW => self.parse_drop_flow(),
+                        _ => self.unsupported(w.to_string()),
+                    }
+                }
                 _ => self.unsupported(w.to_string()),
             },
             unexpected => self.unsupported(unexpected.to_string()),
         }
     }
 
+    fn parse_drop_flow(&mut self) -> Result<Statement> {
+        let _ = self.parser.next_token();
+
+        let if_exists = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let raw_flow_ident = self
+            .parse_object_name()
+            .with_context(|_| error::UnexpectedSnafu {
+                sql: self.sql,
+                expected: "a flow name",
+                actual: self.peek_token_as_string(),
+            })?;
+        let flow_ident = Self::canonicalize_object_name(raw_flow_ident);
+        ensure!(
+            !flow_ident.0.is_empty(),
+            InvalidTableNameSnafu {
+                name: flow_ident.to_string()
+            }
+        );
+
+        Ok(Statement::DropFlow(DropFlow::new(flow_ident, if_exists)))
+    }
+
     fn parse_drop_table(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
 
         let if_exists = self.parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let raw_table_ident =
-            self.parse_object_name()
-                .with_context(|_| error::UnexpectedSnafu {
-                    sql: self.sql,
-                    expected: "a table name",
-                    actual: self.peek_token_as_string(),
-                })?;
-        let table_ident = Self::canonicalize_object_name(raw_table_ident);
-        ensure!(
-            !table_ident.0.is_empty(),
-            InvalidTableNameSnafu {
-                name: table_ident.to_string()
+        let mut table_names = Vec::with_capacity(1);
+        loop {
+            let raw_table_ident =
+                self.parse_object_name()
+                    .with_context(|_| error::UnexpectedSnafu {
+                        sql: self.sql,
+                        expected: "a table name",
+                        actual: self.peek_token_as_string(),
+                    })?;
+            let table_ident = Self::canonicalize_object_name(raw_table_ident);
+            ensure!(
+                !table_ident.0.is_empty(),
+                InvalidTableNameSnafu {
+                    name: table_ident.to_string()
+                }
+            );
+            table_names.push(table_ident);
+            if !self.parser.consume_token(&Token::Comma) {
+                break;
             }
-        );
+        }
 
-        Ok(Statement::DropTable(DropTable::new(table_ident, if_exists)))
+        Ok(Statement::DropTable(DropTable::new(table_names, if_exists)))
     }
 
     fn parse_drop_database(&mut self) -> Result<Statement> {
@@ -93,7 +129,10 @@ mod tests {
         let mut stmts = result.unwrap();
         assert_eq!(
             stmts.pop().unwrap(),
-            Statement::DropTable(DropTable::new(ObjectName(vec![Ident::new("foo")]), false))
+            Statement::DropTable(DropTable::new(
+                vec![ObjectName(vec![Ident::new("foo")])],
+                false
+            ))
         );
 
         let sql = "DROP TABLE IF EXISTS foo";
@@ -102,7 +141,10 @@ mod tests {
         let mut stmts = result.unwrap();
         assert_eq!(
             stmts.pop().unwrap(),
-            Statement::DropTable(DropTable::new(ObjectName(vec![Ident::new("foo")]), true))
+            Statement::DropTable(DropTable::new(
+                vec![ObjectName(vec![Ident::new("foo")])],
+                true
+            ))
         );
 
         let sql = "DROP TABLE my_schema.foo";
@@ -112,7 +154,7 @@ mod tests {
         assert_eq!(
             stmts.pop().unwrap(),
             Statement::DropTable(DropTable::new(
-                ObjectName(vec![Ident::new("my_schema"), Ident::new("foo")]),
+                vec![ObjectName(vec![Ident::new("my_schema"), Ident::new("foo")])],
                 false
             ))
         );
@@ -124,11 +166,11 @@ mod tests {
         assert_eq!(
             stmts.pop().unwrap(),
             Statement::DropTable(DropTable::new(
-                ObjectName(vec![
+                vec![ObjectName(vec![
                     Ident::new("my_catalog"),
                     Ident::new("my_schema"),
                     Ident::new("foo")
-                ]),
+                ])],
                 false
             ))
         )
@@ -171,5 +213,54 @@ mod tests {
                 false
             ))
         );
+    }
+
+    #[test]
+    pub fn test_drop_flow() {
+        let sql = "DROP FLOW foo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let mut stmts: Vec<Statement> = result.unwrap();
+        assert_eq!(
+            stmts.pop().unwrap(),
+            Statement::DropFlow(DropFlow::new(ObjectName(vec![Ident::new("foo")]), false))
+        );
+
+        let sql = "DROP FLOW IF EXISTS foo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let mut stmts = result.unwrap();
+        assert_eq!(
+            stmts.pop().unwrap(),
+            Statement::DropFlow(DropFlow::new(ObjectName(vec![Ident::new("foo")]), true))
+        );
+
+        let sql = "DROP FLOW my_schema.foo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let mut stmts = result.unwrap();
+        assert_eq!(
+            stmts.pop().unwrap(),
+            Statement::DropFlow(DropFlow::new(
+                ObjectName(vec![Ident::new("my_schema"), Ident::new("foo")]),
+                false
+            ))
+        );
+
+        let sql = "DROP FLOW my_catalog.my_schema.foo";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        let mut stmts = result.unwrap();
+        assert_eq!(
+            stmts.pop().unwrap(),
+            Statement::DropFlow(DropFlow::new(
+                ObjectName(vec![
+                    Ident::new("my_catalog"),
+                    Ident::new("my_schema"),
+                    Ident::new("foo")
+                ]),
+                false
+            ))
+        )
     }
 }

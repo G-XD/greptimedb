@@ -42,6 +42,9 @@ pub const METRIC_NAME_LABEL: &str = "__name__";
 
 pub const METRIC_NAME_LABEL_BYTES: &[u8] = b"__name__";
 
+/// The same as `FIELD_COLUMN_MATCHER` in `promql` crate
+pub const FIELD_NAME_LABEL: &str = "__field__";
+
 /// Metrics for push gateway protocol
 pub struct Metrics {
     pub exposition: MetricsExposition<PrometheusType, PrometheusValue>,
@@ -104,11 +107,11 @@ pub fn query_to_plan(dataframe: DataFrame, q: &Query) -> Result<LogicalPlan> {
             }
             // Case sensitive regexp match
             MatcherType::Re => {
-                conditions.push(regexp_match(col(name), lit(value)).is_not_null());
+                conditions.push(regexp_match(col(name), lit(value), None).is_not_null());
             }
             // Case sensitive regexp not match
             MatcherType::Nre => {
-                conditions.push(regexp_match(col(name), lit(value)).is_null());
+                conditions.push(regexp_match(col(name), lit(value), None).is_null());
             }
         }
     }

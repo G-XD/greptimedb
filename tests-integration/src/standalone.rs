@@ -14,28 +14,29 @@
 
 use std::sync::Arc;
 
+use cache::{build_fundamental_cache_registry, with_default_composite_cache_registry};
 use catalog::kvbackend::KvBackendCatalogManager;
-use cmd::options::MixOptions;
+use cmd::standalone::StandaloneOptions;
 use common_base::Plugins;
 use common_catalog::consts::{MIN_USER_FLOW_ID, MIN_USER_TABLE_ID};
 use common_config::KvBackendConfig;
-use common_meta::cache_invalidator::MultiCacheInvalidator;
+use common_meta::cache::LayeredCacheRegistryBuilder;
 use common_meta::ddl::flow_meta::FlowMetadataAllocator;
 use common_meta::ddl::table_meta::TableMetadataAllocator;
-use common_meta::ddl::DdlContext;
+use common_meta::ddl::{DdlContext, NoopRegionFailureDetectorControl};
 use common_meta::ddl_manager::DdlManager;
 use common_meta::key::flow::FlowMetadataManager;
 use common_meta::key::TableMetadataManager;
 use common_meta::kv_backend::KvBackendRef;
+use common_meta::peer::StandalonePeerLookupService;
 use common_meta::region_keeper::MemoryRegionKeeper;
 use common_meta::sequence::SequenceBuilder;
 use common_meta::wal_options_allocator::WalOptionsAllocator;
 use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
-use common_telemetry::logging::LoggingOptions;
 use common_wal::config::{DatanodeWalConfig, MetasrvWalConfig};
 use datanode::datanode::DatanodeBuilder;
-use frontend::frontend::FrontendOptions;
+use flow::FlownodeBuilder;
 use frontend::instance::builder::FrontendBuilder;
 use frontend::instance::{FrontendInstance, Instance, StandaloneDatanodeManager};
 use meta_srv::metasrv::{FLOW_ID_SEQ, TABLE_ID_SEQ};
@@ -45,7 +46,7 @@ use crate::test_util::{self, create_tmp_dir_and_datanode_opts, StorageType, Test
 
 pub struct GreptimeDbStandalone {
     pub instance: Arc<Instance>,
-    pub mix_options: MixOptions,
+    pub opts: StandaloneOptions,
     pub guard: TestGuard,
     // Used in rebuild.
     pub kv_backend: KvBackendRef,
@@ -115,13 +116,13 @@ impl GreptimeDbStandaloneBuilder {
         &self,
         kv_backend: KvBackendRef,
         guard: TestGuard,
-        mix_options: MixOptions,
+        opts: StandaloneOptions,
         procedure_manager: ProcedureManagerRef,
         register_procedure_loaders: bool,
     ) -> GreptimeDbStandalone {
         let plugins = self.plugin.clone().unwrap_or_default();
 
-        let datanode = DatanodeBuilder::new(mix_options.datanode.clone(), plugins.clone())
+        let datanode = DatanodeBuilder::new(opts.datanode_options(), plugins.clone())
             .with_kv_backend(kv_backend.clone())
             .build()
             .await
@@ -129,17 +130,38 @@ impl GreptimeDbStandaloneBuilder {
 
         let table_metadata_manager = Arc::new(TableMetadataManager::new(kv_backend.clone()));
         table_metadata_manager.init().await.unwrap();
+
         let flow_metadata_manager = Arc::new(FlowMetadataManager::new(kv_backend.clone()));
-        let multi_cache_invalidator = Arc::new(MultiCacheInvalidator::default());
+
+        let layered_cache_builder = LayeredCacheRegistryBuilder::default();
+        let fundamental_cache_registry = build_fundamental_cache_registry(kv_backend.clone());
+        let cache_registry = Arc::new(
+            with_default_composite_cache_registry(
+                layered_cache_builder.add_cache_registry(fundamental_cache_registry),
+            )
+            .unwrap()
+            .build(),
+        );
+
         let catalog_manager = KvBackendCatalogManager::new(
             Mode::Standalone,
             None,
             kv_backend.clone(),
-            multi_cache_invalidator.clone(),
-        )
-        .await;
+            cache_registry.clone(),
+        );
 
-        let node_manager = Arc::new(StandaloneDatanodeManager(datanode.region_server()));
+        let flow_builder = FlownodeBuilder::new(
+            Default::default(),
+            plugins.clone(),
+            table_metadata_manager.clone(),
+            catalog_manager.clone(),
+        );
+        let flownode = Arc::new(flow_builder.build().await.unwrap());
+
+        let node_manager = Arc::new(StandaloneDatanodeManager {
+            region_server: datanode.region_server(),
+            flow_server: flownode.flow_worker_manager(),
+        });
 
         let table_id_sequence = Arc::new(
             SequenceBuilder::new(TABLE_ID_SEQ, kv_backend.clone())
@@ -154,7 +176,7 @@ impl GreptimeDbStandaloneBuilder {
                 .build(),
         );
         let wal_options_allocator = Arc::new(WalOptionsAllocator::new(
-            mix_options.wal_meta.clone(),
+            opts.wal.clone().into(),
             kv_backend.clone(),
         ));
         let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
@@ -169,12 +191,14 @@ impl GreptimeDbStandaloneBuilder {
             DdlManager::try_new(
                 DdlContext {
                     node_manager: node_manager.clone(),
-                    cache_invalidator: multi_cache_invalidator,
+                    cache_invalidator: cache_registry.clone(),
                     memory_region_keeper: Arc::new(MemoryRegionKeeper::default()),
                     table_metadata_manager,
                     table_metadata_allocator,
                     flow_metadata_manager,
                     flow_metadata_allocator,
+                    peer_lookup_service: Arc::new(StandalonePeerLookupService::new()),
+                    region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
                 },
                 procedure_manager.clone(),
                 register_procedure_loaders,
@@ -183,7 +207,9 @@ impl GreptimeDbStandaloneBuilder {
         );
 
         let instance = FrontendBuilder::new(
+            opts.frontend_options(),
             kv_backend.clone(),
+            cache_registry,
             catalog_manager,
             node_manager,
             ddl_task_executor,
@@ -192,6 +218,12 @@ impl GreptimeDbStandaloneBuilder {
         .try_build()
         .await
         .unwrap();
+
+        let flow_manager = flownode.flow_worker_manager();
+        flow_manager
+            .set_frontend_invoker(Box::new(instance.clone()))
+            .await;
+        let _node_handle = flow_manager.run_background();
 
         procedure_manager.start().await.unwrap();
         wal_options_allocator.start().await.unwrap();
@@ -202,7 +234,7 @@ impl GreptimeDbStandaloneBuilder {
 
         GreptimeDbStandalone {
             instance: Arc::new(instance),
-            mix_options,
+            opts,
             guard,
             kv_backend,
             procedure_manager,
@@ -231,18 +263,15 @@ impl GreptimeDbStandaloneBuilder {
         .await
         .unwrap();
 
-        let wal_meta = self.metasrv_wal_config.clone();
-        let mix_options = MixOptions {
-            data_home: opts.storage.data_home.to_string(),
+        let standalone_opts = StandaloneOptions {
+            storage: opts.storage,
             procedure: procedure_config,
             metadata_store: kv_backend_config,
-            frontend: FrontendOptions::default(),
-            datanode: opts,
-            logging: LoggingOptions::default(),
-            wal_meta,
+            wal: self.metasrv_wal_config.clone().into(),
+            ..StandaloneOptions::default()
         };
 
-        self.build_with(kv_backend, guard, mix_options, procedure_manager, true)
+        self.build_with(kv_backend, guard, standalone_opts, procedure_manager, true)
             .await
     }
 }

@@ -13,12 +13,37 @@
 // limitations under the License.
 
 //! Transform Substrait into execution plan
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
+use bytes::buf::IntoIter;
+use common_error::ext::BoxedError;
+use common_telemetry::info;
 use datatypes::data_type::ConcreteDataType as CDT;
+use literal::{from_substrait_literal, from_substrait_type};
+use prost::Message;
+use query::parser::QueryLanguageParser;
+use query::plan::LogicalPlan;
+use query::query_engine::DefaultSerializer;
+use query::QueryEngine;
+use serde::{Deserialize, Serialize};
+use session::context::QueryContext;
+use snafu::{OptionExt, ResultExt};
+/// note here we are using the `substrait_proto_df` crate from the `substrait` module and
+/// rename it to `substrait_proto`
+use substrait::{
+    substrait_proto_df as substrait_proto, DFLogicalSubstraitConvertor, SubstraitPlan,
+};
+use substrait_proto::proto::extensions::simple_extension_declaration::MappingType;
+use substrait_proto::proto::extensions::SimpleExtensionDeclaration;
 
-use crate::adapter::error::{Error, NotImplementedSnafu, TableNotFoundSnafu};
+use crate::adapter::FlownodeContext;
+use crate::error::{
+    Error, ExternalSnafu, InvalidQueryProstSnafu, NotImplementedSnafu, TableNotFoundSnafu,
+    UnexpectedSnafu,
+};
 use crate::expr::GlobalId;
+use crate::plan::TypedPlan;
 use crate::repr::RelationType;
 /// a simple macro to generate a not implemented error
 macro_rules! not_impl_err {
@@ -43,22 +68,26 @@ mod expr;
 mod literal;
 mod plan;
 
-use literal::{from_substrait_literal, from_substrait_type};
-use snafu::OptionExt;
-use substrait::substrait_proto::proto::extensions::simple_extension_declaration::MappingType;
-use substrait::substrait_proto::proto::extensions::SimpleExtensionDeclaration;
+pub(crate) use expr::from_scalar_fn_to_df_fn_impl;
 
 /// In Substrait, a function can be define by an u32 anchor, and the anchor can be mapped to a name
 ///
 /// So in substrait plan, a ref to a function can be a single u32 anchor instead of a full name in string
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FunctionExtensions {
-    anchor_to_name: HashMap<u32, String>,
+    anchor_to_name: BTreeMap<u32, String>,
 }
 
 impl FunctionExtensions {
+    pub fn from_iter(inner: impl IntoIterator<Item = (u32, impl ToString)>) -> Self {
+        Self {
+            anchor_to_name: inner.into_iter().map(|(k, s)| (k, s.to_string())).collect(),
+        }
+    }
+
     /// Create a new FunctionExtensions from a list of SimpleExtensionDeclaration
     pub fn try_from_proto(extensions: &[SimpleExtensionDeclaration]) -> Result<Self, Error> {
-        let mut anchor_to_name = HashMap::new();
+        let mut anchor_to_name = BTreeMap::new();
         for e in extensions {
             match &e.mapping_type {
                 Some(ext) => match ext {
@@ -77,39 +106,85 @@ impl FunctionExtensions {
     pub fn get(&self, anchor: &u32) -> Option<&String> {
         self.anchor_to_name.get(anchor)
     }
+
+    pub fn inner_ref(&self) -> HashMap<u32, &String> {
+        self.anchor_to_name.iter().map(|(k, v)| (*k, v)).collect()
+    }
 }
 
-/// A context that holds the information of the dataflow
-pub struct DataflowContext {
-    /// `id` refer to any source table in the dataflow, and `name` is the name of the table
-    /// which is a `Vec<String>` in substrait
-    id_to_name: HashMap<GlobalId, Vec<String>>,
-    /// see `id_to_name`
-    name_to_id: HashMap<Vec<String>, GlobalId>,
-    /// the schema of the table
-    schema: HashMap<GlobalId, RelationType>,
+/// To reuse existing code for parse sql, the sql is first parsed into a datafusion logical plan,
+/// then to a substrait plan, and finally to a flow plan.
+pub async fn sql_to_flow_plan(
+    ctx: &mut FlownodeContext,
+    engine: &Arc<dyn QueryEngine>,
+    sql: &str,
+) -> Result<TypedPlan, Error> {
+    let query_ctx = ctx.query_context.clone().ok_or_else(|| {
+        UnexpectedSnafu {
+            reason: "Query context is missing",
+        }
+        .build()
+    })?;
+    let stmt = QueryLanguageParser::parse_sql(sql, &query_ctx)
+        .map_err(BoxedError::new)
+        .context(ExternalSnafu)?;
+    let plan = engine
+        .planner()
+        .plan(stmt, query_ctx)
+        .await
+        .map_err(BoxedError::new)
+        .context(ExternalSnafu)?;
+    let LogicalPlan::DfPlan(plan) = plan;
+    let sub_plan = DFLogicalSubstraitConvertor {}
+        .to_sub_plan(&plan, DefaultSerializer)
+        .map_err(BoxedError::new)
+        .context(ExternalSnafu)?;
+
+    let flow_plan = TypedPlan::from_substrait_plan(ctx, &sub_plan).await?;
+
+    Ok(flow_plan)
 }
 
-impl DataflowContext {
-    /// Retrieves a GlobalId and table schema representing a table previously registered by calling the [register_table] function.
-    ///
-    /// Returns an error if no table has been registered with the provided names
-    pub fn table(&self, name: &Vec<String>) -> Result<(GlobalId, RelationType), Error> {
-        let id = self
-            .name_to_id
-            .get(name)
-            .copied()
-            .with_context(|| TableNotFoundSnafu {
-                name: name.join("."),
-            })?;
-        let schema = self
-            .schema
-            .get(&id)
-            .cloned()
-            .with_context(|| TableNotFoundSnafu {
-                name: name.join("."),
-            })?;
-        Ok((id, schema))
+/// register flow-specific functions to the query engine
+pub fn register_function_to_query_engine(engine: &Arc<dyn QueryEngine>) {
+    engine.register_function(Arc::new(TumbleFunction {}));
+}
+
+#[derive(Debug)]
+pub struct TumbleFunction {}
+
+const TUMBLE_NAME: &str = "tumble";
+
+impl std::fmt::Display for TumbleFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", TUMBLE_NAME.to_ascii_uppercase())
+    }
+}
+
+impl common_function::function::Function for TumbleFunction {
+    fn name(&self) -> &str {
+        TUMBLE_NAME
+    }
+
+    fn return_type(&self, _input_types: &[CDT]) -> common_query::error::Result<CDT> {
+        Ok(CDT::datetime_datatype())
+    }
+
+    fn signature(&self) -> common_query::prelude::Signature {
+        common_query::prelude::Signature::variadic_any(common_query::prelude::Volatility::Immutable)
+    }
+
+    fn eval(
+        &self,
+        _func_ctx: common_function::function::FunctionContext,
+        _columns: &[datatypes::prelude::VectorRef],
+    ) -> common_query::error::Result<datatypes::prelude::VectorRef> {
+        UnexpectedSnafu {
+            reason: "Tumbler function is not implemented for datafusion executor",
+        }
+        .fail()
+        .map_err(BoxedError::new)
+        .context(common_query::error::ExecuteSnafu)
     }
 }
 
@@ -119,27 +194,64 @@ mod test {
 
     use catalog::RegisterTableRequest;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, NUMBERS_TABLE_ID};
+    use common_time::{Date, DateTime};
+    use datatypes::prelude::*;
+    use datatypes::schema::Schema;
+    use datatypes::vectors::VectorRef;
+    use itertools::Itertools;
     use prost::Message;
     use query::parser::QueryLanguageParser;
     use query::plan::LogicalPlan;
     use query::QueryEngine;
     use session::context::QueryContext;
-    use substrait::substrait_proto::proto;
     use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
+    use substrait_proto::proto;
     use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
+    use table::test_util::MemTable;
 
     use super::*;
+    use crate::adapter::node_context::IdToNameMap;
     use crate::repr::ColumnType;
 
-    pub fn create_test_ctx() -> DataflowContext {
-        let gid = GlobalId::User(0);
-        let name = vec!["numbers".to_string()];
-        let schema = RelationType::new(vec![ColumnType::new(CDT::uint32_datatype(), false)]);
+    pub fn create_test_ctx() -> FlownodeContext {
+        let mut schemas = HashMap::new();
+        let mut tri_map = IdToNameMap::new();
+        {
+            let gid = GlobalId::User(0);
+            let name = [
+                "greptime".to_string(),
+                "public".to_string(),
+                "numbers".to_string(),
+            ];
+            let schema = RelationType::new(vec![ColumnType::new(CDT::uint32_datatype(), false)]);
 
-        DataflowContext {
-            id_to_name: HashMap::from([(gid, name.clone())]),
-            name_to_id: HashMap::from([(name.clone(), gid)]),
-            schema: HashMap::from([(gid, schema)]),
+            tri_map.insert(Some(name.clone()), Some(1024), gid);
+            schemas.insert(gid, schema.into_named(vec![Some("number".to_string())]));
+        }
+
+        {
+            let gid = GlobalId::User(1);
+            let name = [
+                "greptime".to_string(),
+                "public".to_string(),
+                "numbers_with_ts".to_string(),
+            ];
+            let schema = RelationType::new(vec![
+                ColumnType::new(CDT::uint32_datatype(), false),
+                ColumnType::new(CDT::datetime_datatype(), false),
+            ]);
+            schemas.insert(
+                gid,
+                schema.into_named(vec![Some("number".to_string()), Some("ts".to_string())]),
+            );
+            tri_map.insert(Some(name.clone()), Some(1025), gid);
+        }
+
+        FlownodeContext {
+            schema: schemas,
+            table_repr: tri_map,
+            query_context: Some(Arc::new(QueryContext::with("greptime", "public"))),
+            ..Default::default()
         }
     }
 
@@ -153,9 +265,37 @@ mod test {
             table: NumbersTable::table(NUMBERS_TABLE_ID),
         };
         catalog_list.register_table_sync(req).unwrap();
+
+        let schema = vec![
+            datatypes::schema::ColumnSchema::new("number", CDT::uint32_datatype(), false),
+            datatypes::schema::ColumnSchema::new("ts", CDT::datetime_datatype(), false),
+        ];
+        let mut columns = vec![];
+        let numbers = (1..=10).collect_vec();
+        let column: VectorRef = Arc::new(<u32 as Scalar>::VectorType::from_vec(numbers));
+        columns.push(column);
+
+        let ts = (1..=10).collect_vec();
+        let column: VectorRef = Arc::new(<DateTime as Scalar>::VectorType::from_vec(ts));
+        columns.push(column);
+
+        let schema = Arc::new(Schema::new(schema));
+        let recordbatch = common_recordbatch::RecordBatch::new(schema, columns).unwrap();
+        let table = MemTable::table("numbers_with_ts", recordbatch);
+
+        let req_with_ts = RegisterTableRequest {
+            catalog: DEFAULT_CATALOG_NAME.to_string(),
+            schema: DEFAULT_SCHEMA_NAME.to_string(),
+            table_name: "numbers_with_ts".to_string(),
+            table_id: 1024,
+            table,
+        };
+        catalog_list.register_table_sync(req_with_ts).unwrap();
+
         let factory = query::QueryEngineFactory::new(catalog_list, None, None, None, false);
 
         let engine = factory.query_engine();
+        engine.register_function(Arc::new(TumbleFunction {}));
 
         assert_eq!("datafusion", engine.name());
         engine
@@ -172,7 +312,9 @@ mod test {
         let LogicalPlan::DfPlan(plan) = plan;
 
         // encode then decode so to rely on the impl of conversion from logical plan to substrait plan
-        let bytes = DFLogicalSubstraitConvertor {}.encode(&plan).unwrap();
+        let bytes = DFLogicalSubstraitConvertor {}
+            .encode(&plan, DefaultSerializer)
+            .unwrap();
 
         proto::Plan::decode(bytes).unwrap()
     }

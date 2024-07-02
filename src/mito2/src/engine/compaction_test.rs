@@ -131,14 +131,27 @@ async fn test_compaction_region() {
     put_and_flush(&engine, region_id, &column_schemas, 15..25).await;
 
     let result = engine
-        .handle_request(region_id, RegionRequest::Compact(RegionCompactRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Compact(RegionCompactRequest::default()),
+        )
         .await
         .unwrap();
     assert_eq!(result.affected_rows, 0);
 
     let scanner = engine.scanner(region_id, ScanRequest::default()).unwrap();
+    // Input:
+    // [0..9]
+    //       [10...19]
+    //                [20....29]
+    //          -[15.........29]-
+    //           [15.....24]
+    // Output:
+    // [0..9]
+    //     [10..14]
+    //            [15..24]
     assert_eq!(
-        1,
+        3,
         scanner.num_files(),
         "unexpected files: {:?}",
         scanner.file_ids()
@@ -158,8 +171,8 @@ async fn test_compaction_region_with_overlapping() {
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new()
         .insert_option("compaction.type", "twcs")
-        .insert_option("compaction.twcs.max_active_window_files", "2")
-        .insert_option("compaction.twcs.max_inactive_window_files", "2")
+        .insert_option("compaction.twcs.max_active_window_runs", "2")
+        .insert_option("compaction.twcs.max_inactive_window_runs", "2")
         .insert_option("compaction.twcs.time_window", "1h")
         .build();
 
@@ -179,20 +192,16 @@ async fn test_compaction_region_with_overlapping() {
     delete_and_flush(&engine, region_id, &column_schemas, 0..3600).await; // window 3600
 
     let result = engine
-        .handle_request(region_id, RegionRequest::Compact(RegionCompactRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Compact(RegionCompactRequest::default()),
+        )
         .await
         .unwrap();
     assert_eq!(result.affected_rows, 0);
 
     let scanner = engine.scanner(region_id, ScanRequest::default()).unwrap();
-    assert_eq!(
-        2,
-        scanner.num_files(),
-        "unexpected files: {:?}",
-        scanner.file_ids()
-    );
     let stream = scanner.scan().await.unwrap();
-
     let vec = collect_stream_ts(stream).await;
     assert_eq!((3600..10800).map(|i| { i * 1000 }).collect::<Vec<_>>(), vec);
 }
@@ -206,8 +215,8 @@ async fn test_compaction_region_with_overlapping_delete_all() {
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new()
         .insert_option("compaction.type", "twcs")
-        .insert_option("compaction.twcs.max_active_window_files", "2")
-        .insert_option("compaction.twcs.max_inactive_window_files", "2")
+        .insert_option("compaction.twcs.max_active_window_runs", "2")
+        .insert_option("compaction.twcs.max_inactive_window_runs", "2")
         .insert_option("compaction.twcs.time_window", "1h")
         .build();
 
@@ -227,7 +236,10 @@ async fn test_compaction_region_with_overlapping_delete_all() {
     delete_and_flush(&engine, region_id, &column_schemas, 0..10800).await; // window 10800
 
     let result = engine
-        .handle_request(region_id, RegionRequest::Compact(RegionCompactRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Compact(RegionCompactRequest::default()),
+        )
         .await
         .unwrap();
     assert_eq!(result.affected_rows, 0);
@@ -240,7 +252,6 @@ async fn test_compaction_region_with_overlapping_delete_all() {
         scanner.file_ids()
     );
     let stream = scanner.scan().await.unwrap();
-
     let vec = collect_stream_ts(stream).await;
     assert!(vec.is_empty());
 }
@@ -266,7 +277,7 @@ async fn test_readonly_during_compaction() {
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new()
         .insert_option("compaction.type", "twcs")
-        .insert_option("compaction.twcs.max_active_window_files", "1")
+        .insert_option("compaction.twcs.max_active_window_runs", "1")
         .build();
 
     let column_schemas = request
@@ -280,7 +291,7 @@ async fn test_readonly_during_compaction() {
         .unwrap();
     // Flush 2 SSTs for compaction.
     put_and_flush(&engine, region_id, &column_schemas, 0..10).await;
-    put_and_flush(&engine, region_id, &column_schemas, 10..20).await;
+    put_and_flush(&engine, region_id, &column_schemas, 5..20).await;
 
     // Waits until the engine receives compaction finished request.
     listener.wait_handle_finished().await;

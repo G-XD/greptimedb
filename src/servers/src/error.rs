@@ -21,15 +21,16 @@ use axum::response::{IntoResponse, Response};
 use axum::{http, Json};
 use base64::DecodeError;
 use catalog;
+use common_error::define_into_tonic_status;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_telemetry::{debug, error};
 use datatypes::prelude::ConcreteDataType;
+use headers::ContentType;
 use query::parser::PromQuery;
 use serde_json::json;
 use snafu::{Location, Snafu};
-use tonic::Code;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -65,6 +66,7 @@ pub enum Error {
 
     #[snafu(display("Failed to collect recordbatch"))]
     CollectRecordbatch {
+        #[snafu(implicit)]
         location: Location,
         source: common_recordbatch::error::Error,
     },
@@ -82,7 +84,11 @@ pub enum Error {
     },
 
     #[snafu(display("{} server is already started", server))]
-    AlreadyStarted { server: String, location: Location },
+    AlreadyStarted {
+        server: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to bind address {}", addr))]
     TcpBind {
@@ -99,30 +105,35 @@ pub enum Error {
 
     #[snafu(display("Failed to execute query"))]
     ExecuteQuery {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Failed to execute plan"))]
     ExecutePlan {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Execute gRPC query error"))]
     ExecuteGrpcQuery {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Execute gRPC request error"))]
     ExecuteGrpcRequest {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Failed to check database validity"))]
     CheckDatabaseValidity {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
@@ -133,13 +144,28 @@ pub enum Error {
     #[snafu(display("Failed to insert script with name: {}", name))]
     InsertScript {
         name: String,
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
+    },
+
+    #[snafu(display("Pipeline management api error"))]
+    Pipeline {
+        source: pipeline::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unsupported delete pipeline."))]
+    UnsupportedDeletePipeline {
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display("Failed to execute script by name: {}", name))]
     ExecuteScript {
         name: String,
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
@@ -148,13 +174,22 @@ pub enum Error {
     NotSupported { feat: String },
 
     #[snafu(display("Invalid request parameter: {}", reason))]
-    InvalidParameter { reason: String, location: Location },
+    InvalidParameter {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid query: {}", reason))]
-    InvalidQuery { reason: String, location: Location },
+    InvalidQuery {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to parse InfluxDB line protocol"))]
     InfluxdbLineProtocol {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: influxdb_line_protocol::Error,
@@ -162,27 +197,37 @@ pub enum Error {
 
     #[snafu(display("Failed to write row"))]
     RowWriter {
+        #[snafu(implicit)]
         location: Location,
         source: common_grpc::error::Error,
     },
 
     #[snafu(display("Failed to write prometheus series"))]
     PromSeriesWrite {
+        #[snafu(implicit)]
         location: Location,
         source: common_grpc::error::Error,
     },
 
     #[snafu(display("Failed to write OTLP metrics"))]
     OtlpMetricsWrite {
+        #[snafu(implicit)]
         location: Location,
         source: common_grpc::error::Error,
     },
 
     #[snafu(display("Failed to convert time precision, name: {}", name))]
-    TimePrecision { name: String, location: Location },
+    TimePrecision {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Connection reset by peer"))]
-    ConnResetByPeer { location: Location },
+    ConnResetByPeer {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Hyper error"))]
     Hyper {
@@ -190,22 +235,17 @@ pub enum Error {
         error: hyper::Error,
     },
 
-    #[snafu(display("Invalid OpenTSDB line"))]
-    InvalidOpentsdbLine {
-        #[snafu(source)]
-        error: FromUtf8Error,
-        location: Location,
-    },
-
     #[snafu(display("Invalid OpenTSDB Json request"))]
     InvalidOpentsdbJsonRequest {
         #[snafu(source)]
         error: serde_json::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to decode prometheus remote request"))]
     DecodePromRemoteRequest {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: prost::DecodeError,
@@ -213,6 +253,7 @@ pub enum Error {
 
     #[snafu(display("Failed to decode OTLP request"))]
     DecodeOtlpRequest {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: prost::DecodeError,
@@ -220,6 +261,7 @@ pub enum Error {
 
     #[snafu(display("Failed to decompress snappy prometheus remote request"))]
     DecompressSnappyPromRemoteRequest {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: snap::Error,
@@ -227,6 +269,7 @@ pub enum Error {
 
     #[snafu(display("Failed to decompress zstd prometheus remote request"))]
     DecompressZstdPromRemoteRequest {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: std::io::Error,
@@ -234,31 +277,46 @@ pub enum Error {
 
     #[snafu(display("Failed to send prometheus remote request"))]
     SendPromRemoteRequest {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: reqwest::Error,
     },
 
     #[snafu(display("Invalid export metrics config, msg: {}", msg))]
-    InvalidExportMetricsConfig { msg: String, location: Location },
+    InvalidExportMetricsConfig {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to compress prometheus remote request"))]
     CompressPromRemoteRequest {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: snap::Error,
     },
 
     #[snafu(display("Invalid prometheus remote request, msg: {}", msg))]
-    InvalidPromRemoteRequest { msg: String, location: Location },
+    InvalidPromRemoteRequest {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid prometheus remote read query result, msg: {}", msg))]
-    InvalidPromRemoteReadQueryResult { msg: String, location: Location },
+    InvalidPromRemoteReadQueryResult {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid Flight ticket"))]
     InvalidFlightTicket {
         #[snafu(source)]
         error: api::DecodeError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -267,6 +325,7 @@ pub enum Error {
 
     #[snafu(display("Failed to get user info"))]
     Auth {
+        #[snafu(implicit)]
         location: Location,
         source: auth::error::Error,
     },
@@ -284,6 +343,7 @@ pub enum Error {
     InvalidAuthHeaderInvisibleASCII {
         #[snafu(source)]
         error: hyper::header::ToStrError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -291,16 +351,21 @@ pub enum Error {
     InvalidAuthHeaderInvalidUtf8Value {
         #[snafu(source)]
         error: FromUtf8Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid http authorization header"))]
-    InvalidAuthHeader { location: Location },
+    InvalidAuthHeader {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid base64 value"))]
     InvalidBase64Value {
         #[snafu(source)]
         error: DecodeError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -308,32 +373,61 @@ pub enum Error {
     InvalidUtf8Value {
         #[snafu(source)]
         error: FromUtf8Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Error accessing catalog"))]
-    CatalogError { source: catalog::error::Error },
+    CatalogError {
+        source: catalog::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
-    #[snafu(display("Cannot find requested database: {}-{}", catalog, schema))]
-    DatabaseNotFound { catalog: String, schema: String },
+    #[snafu(display("Cannot find requested database: {}.{}", catalog, schema))]
+    DatabaseNotFound {
+        catalog: String,
+        schema: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Cannot find requested table: {}.{}.{}", catalog, schema, table))]
+    TableNotFound {
+        catalog: String,
+        schema: String,
+        table: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[cfg(feature = "mem-prof")]
     #[snafu(display("Failed to dump profile data"))]
     DumpProfileData {
+        #[snafu(implicit)]
         location: Location,
         source: common_mem_prof::error::Error,
     },
 
     #[snafu(display("Invalid prepare statement: {}", err_msg))]
-    InvalidPrepareStatement { err_msg: String },
+    InvalidPrepareStatement {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid flush argument: {}", err_msg))]
-    InvalidFlushArgument { err_msg: String },
+    InvalidFlushArgument {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to build gRPC reflection service"))]
     GrpcReflectionService {
         #[snafu(source)]
         error: tonic_reflection::server::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -341,12 +435,14 @@ pub enum Error {
     BuildHttpResponse {
         #[snafu(source)]
         error: http::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to parse PromQL: {query:?}"))]
     ParsePromQL {
         query: Box<PromQuery>,
+        #[snafu(implicit)]
         location: Location,
         source: query::error::Error,
     },
@@ -354,17 +450,23 @@ pub enum Error {
     #[snafu(display("Failed to get param types"))]
     GetPreparedStmtParams {
         source: query::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("{}", reason))]
-    UnexpectedResult { reason: String, location: Location },
+    UnexpectedResult {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     // this error is used for custom error mapping
     // please do not delete it
     #[snafu(display("Other error"))]
     Other {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -372,6 +474,7 @@ pub enum Error {
     JoinTask {
         #[snafu(source)]
         error: tokio::task::JoinError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -386,6 +489,7 @@ pub enum Error {
     UpdateJemallocMetrics {
         #[snafu(source)]
         error: tikv_jemalloc_ctl::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -393,18 +497,21 @@ pub enum Error {
     DataFrame {
         #[snafu(source)]
         error: datafusion::error::DataFusionError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to replace params with values in prepared statement"))]
     ReplacePreparedStmtParams {
         source: query::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to convert scalar value"))]
     ConvertScalarValue {
         source: datatypes::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -412,6 +519,7 @@ pub enum Error {
     PreparedStmtTypeMismatch {
         expected: ConcreteDataType,
         actual: opensrv_mysql::ColumnType,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -427,6 +535,7 @@ pub enum Error {
         datatype: String,
         expected: i32,
         actual: i32,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -434,6 +543,28 @@ pub enum Error {
     ToJson {
         #[snafu(source)]
         error: serde_json::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to parse payload as json"))]
+    ParseJson {
+        #[snafu(source)]
+        error: serde_json::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to convert to structured log"))]
+    ToStructuredLog {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unsupported content type: {:?}", content_type))]
+    UnsupportedContentType {
+        content_type: ContentType,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -441,19 +572,30 @@ pub enum Error {
     UrlDecode {
         #[snafu(source)]
         error: FromUtf8Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to convert Mysql value, error: {}", err_msg))]
-    MysqlValueConversion { err_msg: String, location: Location },
+    MysqlValueConversion {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Missing query context"))]
-    MissingQueryContext { location: Location },
+    MissingQueryContext {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display(
         "Invalid parameter, physical_table is not expected when metric engine is disabled"
     ))]
-    UnexpectedPhysicalTable { location: Location },
+    UnexpectedPhysicalTable {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to initialize a watcher for file {}", path))]
     FileWatch {
@@ -463,7 +605,11 @@ pub enum Error {
     },
 
     #[snafu(display("Timestamp overflow: {}", error))]
-    TimestampOverflow { error: String, location: Location },
+    TimestampOverflow {
+        error: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -489,6 +635,7 @@ impl ErrorExt for Error {
             | FileWatch { .. } => StatusCode::Internal,
 
             UnsupportedDataType { .. } => StatusCode::Unsupported,
+            UnsupportedDeletePipeline { .. } => StatusCode::Unsupported,
 
             #[cfg(not(windows))]
             UpdateJemallocMetrics { .. } => StatusCode::Internal,
@@ -503,12 +650,13 @@ impl ErrorExt for Error {
             | ExecuteGrpcRequest { source, .. }
             | CheckDatabaseValidity { source, .. } => source.status_code(),
 
+            Pipeline { source, .. } => source.status_code(),
+
             NotSupported { .. }
             | InvalidParameter { .. }
             | InvalidQuery { .. }
             | InfluxdbLineProtocol { .. }
             | ConnResetByPeer { .. }
-            | InvalidOpentsdbLine { .. }
             | InvalidOpentsdbJsonRequest { .. }
             | DecodePromRemoteRequest { .. }
             | DecodeOtlpRequest { .. }
@@ -527,6 +675,9 @@ impl ErrorExt for Error {
             | MissingQueryContext { .. }
             | MysqlValueConversion { .. }
             | UnexpectedPhysicalTable { .. }
+            | ParseJson { .. }
+            | ToStructuredLog { .. }
+            | UnsupportedContentType { .. }
             | TimestampOverflow { .. } => StatusCode::InvalidArguments,
 
             RowWriter { source, .. }
@@ -546,6 +697,9 @@ impl ErrorExt for Error {
             | InvalidAuthHeaderInvalidUtf8Value { .. } => StatusCode::InvalidAuthHeader,
 
             DatabaseNotFound { .. } => StatusCode::DatabaseNotFound,
+
+            TableNotFound { .. } => StatusCode::TableNotFound,
+
             #[cfg(feature = "mem-prof")]
             DumpProfileData { source, .. } => source.status_code(),
 
@@ -582,73 +736,6 @@ impl ErrorExt for Error {
     }
 }
 
-/// Returns the tonic [Code] of a [StatusCode].
-pub fn status_to_tonic_code(status_code: StatusCode) -> Code {
-    match status_code {
-        StatusCode::Success => Code::Ok,
-        StatusCode::Unknown => Code::Unknown,
-        StatusCode::Unsupported => Code::Unimplemented,
-        StatusCode::Unexpected
-        | StatusCode::Internal
-        | StatusCode::PlanQuery
-        | StatusCode::EngineExecuteQuery => Code::Internal,
-        StatusCode::InvalidArguments | StatusCode::InvalidSyntax | StatusCode::RequestOutdated => {
-            Code::InvalidArgument
-        }
-        StatusCode::Cancelled => Code::Cancelled,
-        StatusCode::TableAlreadyExists
-        | StatusCode::TableColumnExists
-        | StatusCode::RegionAlreadyExists => Code::AlreadyExists,
-        StatusCode::TableNotFound
-        | StatusCode::RegionNotFound
-        | StatusCode::TableColumnNotFound
-        | StatusCode::DatabaseNotFound
-        | StatusCode::UserNotFound => Code::NotFound,
-        StatusCode::StorageUnavailable | StatusCode::RegionNotReady => Code::Unavailable,
-        StatusCode::RuntimeResourcesExhausted
-        | StatusCode::RateLimited
-        | StatusCode::RegionBusy => Code::ResourceExhausted,
-        StatusCode::UnsupportedPasswordType
-        | StatusCode::UserPasswordMismatch
-        | StatusCode::AuthHeaderNotFound
-        | StatusCode::InvalidAuthHeader => Code::Unauthenticated,
-        StatusCode::AccessDenied | StatusCode::PermissionDenied | StatusCode::RegionReadonly => {
-            Code::PermissionDenied
-        }
-    }
-}
-
-#[macro_export]
-macro_rules! define_into_tonic_status {
-    ($Error: ty) => {
-        impl From<$Error> for tonic::Status {
-            fn from(err: $Error) -> Self {
-                use tonic::codegen::http::{HeaderMap, HeaderValue};
-                use tonic::metadata::MetadataMap;
-                use $crate::http::header::constants::GREPTIME_DB_HEADER_ERROR_CODE;
-
-                let mut headers = HeaderMap::<HeaderValue>::with_capacity(2);
-
-                // If either of the status_code or error msg cannot convert to valid HTTP header value
-                // (which is a very rare case), just ignore. Client will use Tonic status code and message.
-                let status_code = err.status_code();
-                headers.insert(
-                    GREPTIME_DB_HEADER_ERROR_CODE,
-                    HeaderValue::from(status_code as u32),
-                );
-                let root_error = err.output_msg();
-
-                let metadata = MetadataMap::from_headers(headers);
-                tonic::Status::with_metadata(
-                    $crate::error::status_to_tonic_code(status_code),
-                    root_error,
-                    metadata,
-                )
-            }
-        }
-    };
-}
-
 define_into_tonic_status!(Error);
 
 impl From<std::io::Error> for Error {
@@ -664,7 +751,6 @@ impl IntoResponse for Error {
             Error::InfluxdbLineProtocol { .. }
             | Error::RowWriter { .. }
             | Error::PromSeriesWrite { .. }
-            | Error::InvalidOpentsdbLine { .. }
             | Error::InvalidOpentsdbJsonRequest { .. }
             | Error::DecodePromRemoteRequest { .. }
             | Error::DecodeOtlpRequest { .. }
@@ -677,7 +763,7 @@ impl IntoResponse for Error {
                 if self.status_code().should_log_error() {
                     error!(self; "Failed to handle HTTP request: ");
                 } else {
-                    debug!("Failed to handle HTTP request: {self}");
+                    debug!("Failed to handle HTTP request: {self:?}");
                 }
 
                 HttpStatusCode::INTERNAL_SERVER_ERROR

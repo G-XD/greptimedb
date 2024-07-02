@@ -20,7 +20,7 @@ use common_meta::rpc::procedure::MigrateRegionRequest;
 use common_query::error::Error::ThreadJoin;
 use common_query::error::{InvalidFuncArgsSnafu, MissingProcedureServiceHandlerSnafu, Result};
 use common_query::prelude::{Signature, TypeSignature, Volatility};
-use common_telemetry::logging::error;
+use common_telemetry::error;
 use datatypes::data_type::DataType;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::value::{Value, ValueRef};
@@ -46,10 +46,10 @@ const DEFAULT_REPLAY_TIMEOUT_SECS: u64 = 10;
 /// - `from_peer`:  the source peer id
 /// - `to_peer`:  the target peer id
 #[admin_fn(
-    name = "MigrateRegionFunction",
-    display_name = "migrate_region",
-    sig_fn = "signature",
-    ret = "string"
+    name = MigrateRegionFunction,
+    display_name = migrate_region,
+    sig_fn = signature,
+    ret = string
 )]
 pub(crate) async fn migrate_region(
     procedure_service_handler: &ProcedureServiceHandlerRef,

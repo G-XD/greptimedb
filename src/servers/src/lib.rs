@@ -20,6 +20,7 @@
 use datatypes::schema::Schema;
 use query::plan::LogicalPlan;
 
+pub mod addrs;
 pub mod configurator;
 pub mod error;
 pub mod export_metrics;
@@ -42,7 +43,6 @@ pub mod query_handler;
 pub mod repeated_field;
 mod row_writer;
 pub mod server;
-mod shutdown;
 pub mod tls;
 
 pub use common_config::Mode;

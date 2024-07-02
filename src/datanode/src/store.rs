@@ -25,7 +25,7 @@ use std::time::Duration;
 use std::{env, path};
 
 use common_base::readable_size::ReadableSize;
-use common_telemetry::logging::info;
+use common_telemetry::info;
 use object_store::layers::{LruCacheLayer, RetryLayer};
 use object_store::services::Fs;
 use object_store::util::{join_dir, normalize_dir, with_instrument_layers};
@@ -107,11 +107,12 @@ async fn create_object_store_with_cache(
     if let Some(path) = cache_path {
         let atomic_temp_dir = join_dir(path, ".tmp/");
         clean_temp_dir(&atomic_temp_dir)?;
-        let cache_store = Fs::default()
-            .root(path)
-            .atomic_write_dir(&atomic_temp_dir)
-            .build()
-            .context(error::InitBackendSnafu)?;
+
+        let cache_store = {
+            let mut builder = Fs::default();
+            builder.root(path).atomic_write_dir(&atomic_temp_dir);
+            builder.build().context(error::InitBackendSnafu)?
+        };
 
         let cache_layer = LruCacheLayer::new(Arc::new(cache_store), cache_capacity.0 as usize)
             .await

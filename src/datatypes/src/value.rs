@@ -20,7 +20,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Field};
 use arrow_array::{Array, ListArray};
 use common_base::bytes::{Bytes, StringBytes};
 use common_decimal::Decimal128;
-use common_telemetry::logging;
+use common_telemetry::error;
 use common_time::date::Date;
 use common_time::datetime::DateTime;
 use common_time::interval::IntervalUnit;
@@ -29,7 +29,7 @@ use common_time::timestamp::{TimeUnit, Timestamp};
 use common_time::{Duration, Interval, Timezone};
 use datafusion_common::ScalarValue;
 pub use ordered_float::OrderedFloat;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use snafu::{ensure, ResultExt};
 
 use crate::error::{self, ConvertArrowArrayToScalarsSnafu, Error, Result, TryFromValueSnafu};
@@ -342,7 +342,7 @@ impl Value {
             Value::Float32(v) => ScalarValue::Float32(Some(v.0)),
             Value::Float64(v) => ScalarValue::Float64(Some(v.0)),
             Value::String(v) => ScalarValue::Utf8(Some(v.as_utf8().to_string())),
-            Value::Binary(v) => ScalarValue::LargeBinary(Some(v.to_vec())),
+            Value::Binary(v) => ScalarValue::Binary(Some(v.to_vec())),
             Value::Date(v) => ScalarValue::Date32(Some(v.val())),
             Value::DateTime(v) => ScalarValue::Date64(Some(v.val())),
             Value::Null => to_null_scalar_value(output_type)?,
@@ -413,7 +413,7 @@ pub fn to_null_scalar_value(output_type: &ConcreteDataType) -> Result<ScalarValu
         ConcreteDataType::UInt64(_) => ScalarValue::UInt64(None),
         ConcreteDataType::Float32(_) => ScalarValue::Float32(None),
         ConcreteDataType::Float64(_) => ScalarValue::Float64(None),
-        ConcreteDataType::Binary(_) => ScalarValue::LargeBinary(None),
+        ConcreteDataType::Binary(_) => ScalarValue::Binary(None),
         ConcreteDataType::String(_) => ScalarValue::Utf8(None),
         ConcreteDataType::Date(_) => ScalarValue::Date32(None),
         ConcreteDataType::DateTime(_) => ScalarValue::Date64(None),
@@ -487,7 +487,7 @@ pub fn scalar_value_to_timestamp(
         ScalarValue::Utf8(Some(s)) => match Timestamp::from_str(s, timezone) {
             Ok(t) => Some(t),
             Err(e) => {
-                logging::error!(e;"Failed to convert string literal {s} to timestamp");
+                error!(e;"Failed to convert string literal {s} to timestamp");
                 None
             }
         },
@@ -695,7 +695,7 @@ impl TryFrom<Value> for serde_json::Value {
             Value::Int64(v) => serde_json::Value::from(v),
             Value::Float32(v) => serde_json::Value::from(v.0),
             Value::Float64(v) => serde_json::Value::from(v.0),
-            Value::String(bytes) => serde_json::Value::String(bytes.as_utf8().to_string()),
+            Value::String(bytes) => serde_json::Value::String(bytes.into_string()),
             Value::Binary(bytes) => serde_json::to_value(bytes)?,
             Value::Date(v) => serde_json::Value::Number(v.val().into()),
             Value::DateTime(v) => serde_json::Value::Number(v.val().into()),
@@ -882,7 +882,8 @@ impl TryFrom<ScalarValue> for Value {
             | ScalarValue::FixedSizeList(_)
             | ScalarValue::LargeList(_)
             | ScalarValue::Dictionary(_, _)
-            | ScalarValue::Union(_, _, _) => {
+            | ScalarValue::Union(_, _, _)
+            | ScalarValue::Float16(_) => {
                 return error::UnsupportedArrowTypeSnafu {
                     arrow_type: v.data_type(),
                 }
@@ -1164,6 +1165,39 @@ impl<'a> From<Option<ListValueRef<'a>>> for ValueRef<'a> {
     }
 }
 
+impl<'a> TryFrom<ValueRef<'a>> for serde_json::Value {
+    type Error = serde_json::Error;
+
+    fn try_from(value: ValueRef<'a>) -> serde_json::Result<serde_json::Value> {
+        let json_value = match value {
+            ValueRef::Null => serde_json::Value::Null,
+            ValueRef::Boolean(v) => serde_json::Value::Bool(v),
+            ValueRef::UInt8(v) => serde_json::Value::from(v),
+            ValueRef::UInt16(v) => serde_json::Value::from(v),
+            ValueRef::UInt32(v) => serde_json::Value::from(v),
+            ValueRef::UInt64(v) => serde_json::Value::from(v),
+            ValueRef::Int8(v) => serde_json::Value::from(v),
+            ValueRef::Int16(v) => serde_json::Value::from(v),
+            ValueRef::Int32(v) => serde_json::Value::from(v),
+            ValueRef::Int64(v) => serde_json::Value::from(v),
+            ValueRef::Float32(v) => serde_json::Value::from(v.0),
+            ValueRef::Float64(v) => serde_json::Value::from(v.0),
+            ValueRef::String(bytes) => serde_json::Value::String(bytes.to_string()),
+            ValueRef::Binary(bytes) => serde_json::to_value(bytes)?,
+            ValueRef::Date(v) => serde_json::Value::Number(v.val().into()),
+            ValueRef::DateTime(v) => serde_json::Value::Number(v.val().into()),
+            ValueRef::List(v) => serde_json::to_value(v)?,
+            ValueRef::Timestamp(v) => serde_json::to_value(v.value())?,
+            ValueRef::Time(v) => serde_json::to_value(v.value())?,
+            ValueRef::Interval(v) => serde_json::to_value(v.to_i128())?,
+            ValueRef::Duration(v) => serde_json::to_value(v.value())?,
+            ValueRef::Decimal128(v) => serde_json::to_value(v.to_string())?,
+        };
+
+        Ok(json_value)
+    }
+}
+
 /// Reference to a [ListValue].
 ///
 /// Now comparison still requires some allocation (call of `to_value()`) and
@@ -1190,6 +1224,18 @@ impl<'a> ListValueRef<'a> {
         match self {
             ListValueRef::Indexed { vector, .. } => vector.data_type(),
             ListValueRef::Ref { val } => val.datatype().clone(),
+        }
+    }
+}
+
+impl<'a> Serialize for ListValueRef<'a> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            ListValueRef::Indexed { vector, idx } => match vector.get(*idx) {
+                Value::List(v) => v.serialize(serializer),
+                _ => unreachable!(),
+            },
+            ListValueRef::Ref { val } => val.serialize(serializer),
         }
     }
 }
@@ -2105,7 +2151,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            ScalarValue::LargeBinary(Some("world".as_bytes().to_vec())),
+            ScalarValue::Binary(Some("world".as_bytes().to_vec())),
             Value::Binary(Bytes::from("world".as_bytes()))
                 .try_to_scalar_value(&ConcreteDataType::binary_datatype())
                 .unwrap()
@@ -2187,7 +2233,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            ScalarValue::LargeBinary(None),
+            ScalarValue::Binary(None),
             Value::Null
                 .try_to_scalar_value(&ConcreteDataType::binary_datatype())
                 .unwrap()

@@ -26,7 +26,7 @@ use datatypes::prelude::ConcreteDataType;
 use datatypes::scalars::ScalarVector;
 use datatypes::vectors::{Float64Vector, StringVector, TimestampMillisecondVector};
 use promql_parser::label::METRIC_NAME;
-use promql_parser::parser::ValueType;
+use promql_parser::parser::value::ValueType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -132,7 +132,7 @@ impl PrometheusJsonResponse {
             if let Some(physical_plan) = result.meta.plan {
                 let mut result_map = HashMap::new();
                 let mut tmp = vec![&mut result_map];
-                collect_plan_metrics(physical_plan, &mut tmp);
+                collect_plan_metrics(&physical_plan, &mut tmp);
 
                 let re = result_map
                     .into_iter()

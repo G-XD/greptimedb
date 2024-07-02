@@ -18,22 +18,28 @@ use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 
 use api::region::RegionResponse;
-use api::v1::region::{region_request, QueryRequest, RegionResponse as RegionResponseV1};
+use api::v1::region::{region_request, RegionResponse as RegionResponseV1};
 use api::v1::{ResponseHeader, Status};
 use arrow_flight::{FlightData, Ticket};
 use async_trait::async_trait;
 use bytes::Bytes;
 use common_error::ext::BoxedError;
 use common_error::status_code::StatusCode;
+use common_query::request::QueryRequest;
 use common_query::OutputData;
 use common_recordbatch::SendableRecordBatchStream;
 use common_runtime::Runtime;
 use common_telemetry::tracing::{self, info_span};
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
-use common_telemetry::{info, warn};
+use common_telemetry::{error, info, warn};
 use dashmap::DashMap;
+use datafusion::datasource::{provider_as_source, TableProvider};
+use datafusion::error::Result as DfResult;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
+use datafusion_expr::{LogicalPlan, TableSource};
 use futures_util::future::try_join_all;
 use metric_engine::engine::MetricEngine;
+use mito2::engine::MITO_ENGINE_NAME;
 use prost::Message;
 pub use query::dummy_catalog::{
     DummyCatalogList, DummyTableProviderFactory, TableProviderFactoryRef,
@@ -43,18 +49,22 @@ use servers::error::{self as servers_error, ExecuteGrpcRequestSnafu, Result as S
 use servers::grpc::flight::{FlightCraft, FlightRecordBatchStream, TonicStream};
 use servers::grpc::region_server::RegionServerHandler;
 use session::context::{QueryContextBuilder, QueryContextRef};
-use snafu::{OptionExt, ResultExt};
-use store_api::metric_engine_consts::{METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY};
+use snafu::{ensure, OptionExt, ResultExt};
+use store_api::metric_engine_consts::{
+    FILE_ENGINE_NAME, LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME,
+};
 use store_api::region_engine::{RegionEngineRef, RegionRole, SetReadonlyResponse};
-use store_api::region_request::{AffectedRows, RegionCloseRequest, RegionRequest};
+use store_api::region_request::{
+    AffectedRows, RegionCloseRequest, RegionOpenRequest, RegionRequest,
+};
 use store_api::storage::RegionId;
-use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use tonic::{Request, Response, Result as TonicResult};
 
 use crate::error::{
-    self, BuildRegionRequestsSnafu, DecodeLogicalPlanSnafu, ExecuteLogicalPlanSnafu,
-    FindLogicalRegionsSnafu, HandleRegionRequestSnafu, RegionEngineNotFoundSnafu,
-    RegionNotFoundSnafu, Result, StopRegionEngineSnafu, UnexpectedSnafu, UnsupportedOutputSnafu,
+    self, BuildRegionRequestsSnafu, DataFusionSnafu, DecodeLogicalPlanSnafu,
+    ExecuteLogicalPlanSnafu, FindLogicalRegionsSnafu, HandleBatchOpenRequestSnafu,
+    HandleRegionRequestSnafu, NewPlanDecoderSnafu, RegionEngineNotFoundSnafu, RegionNotFoundSnafu,
+    RegionNotReadySnafu, Result, StopRegionEngineSnafu, UnexpectedSnafu, UnsupportedOutputSnafu,
 };
 use crate::event_listener::RegionServerEventListenerRef;
 
@@ -113,6 +123,17 @@ impl RegionServer {
             })
     }
 
+    #[tracing::instrument(skip_all)]
+    pub async fn handle_batch_open_requests(
+        &self,
+        parallelism: usize,
+        requests: Vec<(RegionId, RegionOpenRequest)>,
+    ) -> Result<Vec<RegionId>> {
+        self.inner
+            .handle_batch_open_requests(parallelism, requests)
+            .await
+    }
+
     #[tracing::instrument(skip_all, fields(request_type = request.request_type()))]
     pub async fn handle_request(
         &self,
@@ -122,9 +143,94 @@ impl RegionServer {
         self.inner.handle_request(region_id, request).await
     }
 
+    async fn table_provider(&self, region_id: RegionId) -> Result<Arc<dyn TableProvider>> {
+        let status = self
+            .inner
+            .region_map
+            .get(&region_id)
+            .context(RegionNotFoundSnafu { region_id })?
+            .clone();
+        ensure!(
+            matches!(status, RegionEngineWithStatus::Ready(_)),
+            RegionNotReadySnafu { region_id }
+        );
+
+        self.inner
+            .table_provider_factory
+            .create(region_id, status.into_engine())
+            .await
+            .context(ExecuteLogicalPlanSnafu)
+    }
+
+    /// Handle reads from remote. They're often query requests received by our Arrow Flight service.
+    pub async fn handle_remote_read(
+        &self,
+        request: api::v1::region::QueryRequest,
+    ) -> Result<SendableRecordBatchStream> {
+        let region_id = RegionId::from_u64(request.region_id);
+        let provider = self.table_provider(region_id).await?;
+        let catalog_list = Arc::new(DummyCatalogList::with_table_provider(provider));
+
+        let query_ctx: QueryContextRef = request
+            .header
+            .as_ref()
+            .map(|h| Arc::new(h.into()))
+            .unwrap_or_else(|| Arc::new(QueryContextBuilder::default().build()));
+
+        let decoder = self
+            .inner
+            .query_engine
+            .engine_context(query_ctx)
+            .new_plan_decoder()
+            .context(NewPlanDecoderSnafu)?;
+
+        let plan = decoder
+            .decode(Bytes::from(request.plan), catalog_list, false)
+            .await
+            .context(DecodeLogicalPlanSnafu)?;
+
+        self.inner
+            .handle_read(QueryRequest {
+                header: request.header,
+                region_id,
+                plan,
+            })
+            .await
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn handle_read(&self, request: QueryRequest) -> Result<SendableRecordBatchStream> {
-        self.inner.handle_read(request).await
+        let provider = self.table_provider(request.region_id).await?;
+
+        struct RegionDataSourceInjector {
+            source: Arc<dyn TableSource>,
+        }
+
+        impl TreeNodeRewriter for RegionDataSourceInjector {
+            type Node = LogicalPlan;
+
+            fn f_up(&mut self, node: Self::Node) -> DfResult<Transformed<Self::Node>> {
+                Ok(match node {
+                    LogicalPlan::TableScan(mut scan) => {
+                        scan.source = self.source.clone();
+                        Transformed::yes(LogicalPlan::TableScan(scan))
+                    }
+                    _ => Transformed::no(node),
+                })
+            }
+        }
+
+        let plan = request
+            .plan
+            .rewrite(&mut RegionDataSourceInjector {
+                source: provider_as_source(provider),
+            })
+            .context(DataFusionSnafu)?
+            .data;
+
+        self.inner
+            .handle_read(QueryRequest { plan, ..request })
+            .await
     }
 
     /// Returns all opened and reportable regions.
@@ -184,9 +290,9 @@ impl RegionServer {
         self.inner.runtime.clone()
     }
 
-    pub async fn region_disk_usage(&self, region_id: RegionId) -> Option<i64> {
+    pub fn region_disk_usage(&self, region_id: RegionId) -> Option<i64> {
         match self.inner.region_map.get(&region_id) {
-            Some(e) => e.region_disk_usage(region_id).await,
+            Some(e) => e.region_disk_usage(region_id),
             None => None,
         }
     }
@@ -216,6 +322,7 @@ impl RegionServerHandler for RegionServer {
             .context(BuildRegionRequestsSnafu)
             .map_err(BoxedError::new)
             .context(ExecuteGrpcRequestSnafu)?;
+
         let tracing_context = TracingContext::from_current_span();
 
         let results = if is_parallel {
@@ -285,7 +392,7 @@ impl FlightCraft for RegionServer {
         request: Request<Ticket>,
     ) -> TonicResult<Response<TonicStream<FlightData>>> {
         let ticket = request.into_inner().ticket;
-        let request = QueryRequest::decode(ticket.as_ref())
+        let request = api::v1::region::QueryRequest::decode(ticket.as_ref())
             .context(servers_error::InvalidFlightTicketSnafu)?;
         let tracing_context = request
             .header
@@ -294,7 +401,7 @@ impl FlightCraft for RegionServer {
             .unwrap_or_default();
 
         let result = self
-            .handle_read(request)
+            .handle_remote_read(request)
             .trace(tracing_context.attach(info_span!("RegionServer::handle_read")))
             .await?;
 
@@ -321,10 +428,6 @@ impl RegionEngineWithStatus {
             RegionEngineWithStatus::Deregistering(engine) => engine,
             RegionEngineWithStatus::Ready(engine) => engine,
         }
-    }
-
-    pub fn is_registering(&self) -> bool {
-        matches!(self, Self::Registering(_))
     }
 }
 
@@ -403,11 +506,9 @@ impl RegionServerInner {
         let current_region_status = self.region_map.get(&region_id);
 
         let engine = match region_change {
-            RegionChange::Register(ref engine_type, _) => match current_region_status {
+            RegionChange::Register(attribute) => match current_region_status {
                 Some(status) => match status.clone() {
-                    RegionEngineWithStatus::Registering(_) => {
-                        return Ok(CurrentEngine::EarlyReturn(0))
-                    }
+                    RegionEngineWithStatus::Registering(engine) => engine,
                     RegionEngineWithStatus::Deregistering(_) => {
                         return error::RegionBusySnafu { region_id }.fail()
                     }
@@ -417,8 +518,10 @@ impl RegionServerInner {
                     .engines
                     .read()
                     .unwrap()
-                    .get(engine_type)
-                    .with_context(|| RegionEngineNotFoundSnafu { name: engine_type })?
+                    .get(attribute.engine())
+                    .with_context(|| RegionEngineNotFoundSnafu {
+                        name: attribute.engine(),
+                    })?
                     .clone(),
             },
             RegionChange::Deregisters => match current_region_status {
@@ -433,7 +536,7 @@ impl RegionServerInner {
                 },
                 None => return Ok(CurrentEngine::EarlyReturn(0)),
             },
-            RegionChange::None => match current_region_status {
+            RegionChange::None | RegionChange::Catchup => match current_region_status {
                 Some(status) => match status.clone() {
                     RegionEngineWithStatus::Registering(_) => {
                         return error::RegionNotReadySnafu { region_id }.fail()
@@ -450,6 +553,113 @@ impl RegionServerInner {
         Ok(CurrentEngine::Engine(engine))
     }
 
+    async fn handle_batch_open_requests_inner(
+        &self,
+        engine: RegionEngineRef,
+        parallelism: usize,
+        requests: Vec<(RegionId, RegionOpenRequest)>,
+    ) -> Result<Vec<RegionId>> {
+        let region_changes = requests
+            .iter()
+            .map(|(region_id, open)| {
+                let attribute = parse_region_attribute(&open.engine, &open.options)?;
+                Ok((*region_id, RegionChange::Register(attribute)))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        for (&region_id, region_change) in &region_changes {
+            self.set_region_status_not_ready(region_id, &engine, region_change)
+        }
+
+        let mut open_regions = Vec::with_capacity(requests.len());
+        let mut errors = vec![];
+        match engine
+            .handle_batch_open_requests(parallelism, requests)
+            .await
+            .with_context(|_| HandleBatchOpenRequestSnafu)
+        {
+            Ok(results) => {
+                for (region_id, result) in results {
+                    let region_change = &region_changes[&region_id];
+                    match result {
+                        Ok(_) => {
+                            if let Err(e) = self
+                                .set_region_status_ready(region_id, engine.clone(), *region_change)
+                                .await
+                            {
+                                error!(e; "Failed to set region to ready: {}", region_id);
+                                errors.push(BoxedError::new(e));
+                            } else {
+                                open_regions.push(region_id)
+                            }
+                        }
+                        Err(e) => {
+                            self.unset_region_status(region_id, *region_change);
+                            error!(e; "Failed to open region: {}", region_id);
+                            errors.push(e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                for (&region_id, region_change) in &region_changes {
+                    self.unset_region_status(region_id, *region_change);
+                }
+                error!(e; "Failed to open batch regions");
+                errors.push(BoxedError::new(e));
+            }
+        }
+
+        if !errors.is_empty() {
+            return error::UnexpectedSnafu {
+                // Returns the first error.
+                violated: format!("Failed to open batch regions: {:?}", errors[0]),
+            }
+            .fail();
+        }
+
+        Ok(open_regions)
+    }
+
+    pub async fn handle_batch_open_requests(
+        &self,
+        parallelism: usize,
+        requests: Vec<(RegionId, RegionOpenRequest)>,
+    ) -> Result<Vec<RegionId>> {
+        let mut engine_grouped_requests: HashMap<String, Vec<_>> =
+            HashMap::with_capacity(requests.len());
+        for (region_id, request) in requests {
+            if let Some(requests) = engine_grouped_requests.get_mut(&request.engine) {
+                requests.push((region_id, request));
+            } else {
+                engine_grouped_requests
+                    .insert(request.engine.to_string(), vec![(region_id, request)]);
+            }
+        }
+
+        let mut results = Vec::with_capacity(engine_grouped_requests.keys().len());
+        for (engine, requests) in engine_grouped_requests {
+            let engine = self
+                .engines
+                .read()
+                .unwrap()
+                .get(&engine)
+                .with_context(|| RegionEngineNotFoundSnafu { name: &engine })?
+                .clone();
+            results.push(
+                self.handle_batch_open_requests_inner(engine, parallelism, requests)
+                    .await,
+            )
+        }
+
+        Ok(results
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>())
+    }
+
     pub async fn handle_request(
         &self,
         region_id: RegionId,
@@ -461,11 +671,13 @@ impl RegionServerInner {
             .start_timer();
 
         let region_change = match &request {
-            RegionRequest::Create(create) => RegionChange::Register(create.engine.clone(), false),
+            RegionRequest::Create(create) => {
+                let attribute = parse_region_attribute(&create.engine, &create.options)?;
+                RegionChange::Register(attribute)
+            }
             RegionRequest::Open(open) => {
-                let is_opening_physical_region =
-                    open.options.contains_key(PHYSICAL_TABLE_METADATA_KEY);
-                RegionChange::Register(open.engine.clone(), is_opening_physical_region)
+                let attribute = parse_region_attribute(&open.engine, &open.options)?;
+                RegionChange::Register(attribute)
             }
             RegionRequest::Close(_) | RegionRequest::Drop(_) => RegionChange::Deregisters,
             RegionRequest::Put(_)
@@ -473,8 +685,8 @@ impl RegionServerInner {
             | RegionRequest::Alter(_)
             | RegionRequest::Flush(_)
             | RegionRequest::Compact(_)
-            | RegionRequest::Truncate(_)
-            | RegionRequest::Catchup(_) => RegionChange::None,
+            | RegionRequest::Truncate(_) => RegionChange::None,
+            RegionRequest::Catchup(_) => RegionChange::Catchup,
         };
 
         let engine = match self.get_engine(region_id, &region_change)? {
@@ -514,7 +726,7 @@ impl RegionServerInner {
         region_change: &RegionChange,
     ) {
         match region_change {
-            RegionChange::Register(_, _) => {
+            RegionChange::Register(_) => {
                 self.region_map.insert(
                     region_id,
                     RegionEngineWithStatus::Registering(engine.clone()),
@@ -533,9 +745,10 @@ impl RegionServerInner {
     fn unset_region_status(&self, region_id: RegionId, region_change: RegionChange) {
         match region_change {
             RegionChange::None => {}
-            RegionChange::Register(_, _) | RegionChange::Deregisters => {
+            RegionChange::Register(_) | RegionChange::Deregisters => {
                 self.region_map.remove(&region_id);
             }
+            RegionChange::Catchup => {}
         }
     }
 
@@ -548,15 +761,28 @@ impl RegionServerInner {
         let engine_type = engine.name();
         match region_change {
             RegionChange::None => {}
-            RegionChange::Register(_, is_opening_physical_region) => {
-                if is_opening_physical_region {
-                    self.register_logical_regions(&engine, region_id).await?;
-                }
-
-                info!("Region {region_id} is registered to engine {engine_type}");
+            RegionChange::Register(attribute) => {
+                info!(
+                    "Region {region_id} is registered to engine {}",
+                    attribute.engine()
+                );
                 self.region_map
-                    .insert(region_id, RegionEngineWithStatus::Ready(engine));
-                self.event_listener.on_region_registered(region_id);
+                    .insert(region_id, RegionEngineWithStatus::Ready(engine.clone()));
+
+                match attribute {
+                    RegionAttribute::Metric { physical } => {
+                        if physical {
+                            // Registers the logical regions belong to the physical region (`region_id`).
+                            self.register_logical_regions(&engine, region_id).await?;
+                            // We only send the `on_region_registered` event of the physical region.
+                            self.event_listener.on_region_registered(region_id);
+                        }
+                    }
+                    RegionAttribute::Mito => self.event_listener.on_region_registered(region_id),
+                    RegionAttribute::File => {
+                        // do nothing
+                    }
+                }
             }
             RegionChange::Deregisters => {
                 info!("Region {region_id} is deregistered from engine {engine_type}");
@@ -564,6 +790,12 @@ impl RegionServerInner {
                     .remove(&region_id)
                     .map(|(id, engine)| engine.set_writable(id, false));
                 self.event_listener.on_region_deregistered(region_id);
+            }
+            RegionChange::Catchup => {
+                if is_metric_engine(engine.name()) {
+                    // Registers the logical regions belong to the physical region (`region_id`).
+                    self.register_logical_regions(&engine, region_id).await?;
+                }
             }
         }
         Ok(())
@@ -602,52 +834,16 @@ impl RegionServerInner {
     pub async fn handle_read(&self, request: QueryRequest) -> Result<SendableRecordBatchStream> {
         // TODO(ruihang): add metrics and set trace id
 
-        let QueryRequest {
-            header,
-            region_id,
-            plan,
-        } = request;
-        let region_id = RegionId::from_u64(region_id);
-
         // Build query context from gRPC header
-        let ctx: QueryContextRef = header
+        let query_ctx: QueryContextRef = request
+            .header
             .as_ref()
             .map(|h| Arc::new(h.into()))
-            .unwrap_or_else(|| QueryContextBuilder::default().build());
-
-        // build dummy catalog list
-        let region_status = self
-            .region_map
-            .get(&region_id)
-            .with_context(|| RegionNotFoundSnafu { region_id })?
-            .clone();
-
-        if region_status.is_registering() {
-            return error::RegionNotReadySnafu { region_id }.fail();
-        }
-
-        let table_provider = self
-            .table_provider_factory
-            .create(region_id, region_status.into_engine())
-            .await
-            .context(ExecuteLogicalPlanSnafu)?;
-
-        let catalog_list = Arc::new(DummyCatalogList::with_table_provider(table_provider));
-        let query_engine_ctx = self.query_engine.engine_context(ctx.clone());
-        // decode substrait plan to logical plan and execute it
-        let logical_plan = DFLogicalSubstraitConvertor
-            .decode(
-                Bytes::from(plan),
-                catalog_list,
-                query_engine_ctx.state().clone(),
-                ctx.clone(),
-            )
-            .await
-            .context(DecodeLogicalPlanSnafu)?;
+            .unwrap_or_else(|| QueryContextBuilder::default().build().into());
 
         let result = self
             .query_engine
-            .execute(logical_plan.into(), ctx)
+            .execute(request.plan.into(), query_ctx)
             .await
             .context(ExecuteLogicalPlanSnafu)?;
 
@@ -697,10 +893,52 @@ impl RegionServerInner {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 enum RegionChange {
     None,
-    Register(String, bool),
+    Register(RegionAttribute),
     Deregisters,
+    Catchup,
+}
+
+fn is_metric_engine(engine: &str) -> bool {
+    engine == METRIC_ENGINE_NAME
+}
+
+fn parse_region_attribute(
+    engine: &str,
+    options: &HashMap<String, String>,
+) -> Result<RegionAttribute> {
+    match engine {
+        MITO_ENGINE_NAME => Ok(RegionAttribute::Mito),
+        METRIC_ENGINE_NAME => {
+            let physical = !options.contains_key(LOGICAL_TABLE_METADATA_KEY);
+
+            Ok(RegionAttribute::Metric { physical })
+        }
+        FILE_ENGINE_NAME => Ok(RegionAttribute::File),
+        _ => error::UnexpectedSnafu {
+            violated: format!("Unknown engine: {}", engine),
+        }
+        .fail(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RegionAttribute {
+    Mito,
+    Metric { physical: bool },
+    File,
+}
+
+impl RegionAttribute {
+    fn engine(&self) -> &'static str {
+        match self {
+            RegionAttribute::Mito => MITO_ENGINE_NAME,
+            RegionAttribute::Metric { .. } => METRIC_ENGINE_NAME,
+            RegionAttribute::File => FILE_ENGINE_NAME,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -723,36 +961,34 @@ mod tests {
         common_telemetry::init_default_ut_logging();
 
         let mut mock_region_server = mock_region_server();
-        let (engine, _receiver) = MockRegionEngine::new();
+        let (engine, _receiver) = MockRegionEngine::new(MITO_ENGINE_NAME);
         let engine_name = engine.name();
-
         mock_region_server.register_engine(engine.clone());
-
         let region_id = RegionId::new(1, 1);
         let builder = CreateRequestBuilder::new();
         let create_req = builder.build();
-
         // Tries to create/open a registering region.
         mock_region_server.inner.region_map.insert(
             region_id,
             RegionEngineWithStatus::Registering(engine.clone()),
         );
-
         let response = mock_region_server
             .handle_request(region_id, RegionRequest::Create(create_req))
             .await
             .unwrap();
         assert_eq!(response.affected_rows, 0);
-
         let status = mock_region_server
             .inner
             .region_map
             .get(&region_id)
             .unwrap()
             .clone();
+        assert!(matches!(status, RegionEngineWithStatus::Ready(_)));
 
-        assert!(matches!(status, RegionEngineWithStatus::Registering(_)));
-
+        mock_region_server.inner.region_map.insert(
+            region_id,
+            RegionEngineWithStatus::Registering(engine.clone()),
+        );
         let response = mock_region_server
             .handle_request(
                 region_id,
@@ -766,14 +1002,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.affected_rows, 0);
-
         let status = mock_region_server
             .inner
             .region_map
             .get(&region_id)
             .unwrap()
             .clone();
-        assert!(matches!(status, RegionEngineWithStatus::Registering(_)));
+        assert!(matches!(status, RegionEngineWithStatus::Ready(_)));
     }
 
     #[tokio::test]
@@ -781,7 +1016,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
 
         let mut mock_region_server = mock_region_server();
-        let (engine, _receiver) = MockRegionEngine::new();
+        let (engine, _receiver) = MockRegionEngine::new(MITO_ENGINE_NAME);
 
         mock_region_server.register_engine(engine.clone());
 
@@ -832,7 +1067,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
 
         let mut mock_region_server = mock_region_server();
-        let (engine, _receiver) = MockRegionEngine::new();
+        let (engine, _receiver) = MockRegionEngine::new(MITO_ENGINE_NAME);
 
         mock_region_server.register_engine(engine.clone());
 
@@ -857,13 +1092,15 @@ mod tests {
         common_telemetry::init_default_ut_logging();
 
         let mut mock_region_server = mock_region_server();
-        let (engine, _receiver) =
-            MockRegionEngine::with_mock_fn(Box::new(|_region_id, _request| {
+        let (engine, _receiver) = MockRegionEngine::with_mock_fn(
+            MITO_ENGINE_NAME,
+            Box::new(|_region_id, _request| {
                 error::UnexpectedSnafu {
                     violated: "test".to_string(),
                 }
                 .fail()
-            }));
+            }),
+        );
 
         mock_region_server.register_engine(engine.clone());
 
@@ -904,7 +1141,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
 
         let mut mock_region_server = mock_region_server();
-        let (engine, _) = MockRegionEngine::new();
+        let (engine, _) = MockRegionEngine::new(MITO_ENGINE_NAME);
         mock_region_server.register_engine(engine.clone());
 
         let region_id = RegionId::new(1024, 1);
@@ -950,7 +1187,7 @@ mod tests {
             CurrentEngineTest {
                 region_id,
                 current_region_status: None,
-                region_change: RegionChange::Register(engine.name().to_string(), false),
+                region_change: RegionChange::Register(RegionAttribute::Mito),
                 assert: Box::new(|result| {
                     let current_engine = result.unwrap();
                     assert_matches!(current_engine, CurrentEngine::Engine(_));
@@ -959,16 +1196,16 @@ mod tests {
             CurrentEngineTest {
                 region_id,
                 current_region_status: Some(RegionEngineWithStatus::Registering(engine.clone())),
-                region_change: RegionChange::Register(engine.name().to_string(), false),
+                region_change: RegionChange::Register(RegionAttribute::Mito),
                 assert: Box::new(|result| {
                     let current_engine = result.unwrap();
-                    assert_matches!(current_engine, CurrentEngine::EarlyReturn(_));
+                    assert_matches!(current_engine, CurrentEngine::Engine(_));
                 }),
             },
             CurrentEngineTest {
                 region_id,
                 current_region_status: Some(RegionEngineWithStatus::Deregistering(engine.clone())),
-                region_change: RegionChange::Register(engine.name().to_string(), false),
+                region_change: RegionChange::Register(RegionAttribute::Mito),
                 assert: Box::new(|result| {
                     let err = result.unwrap_err();
                     assert_eq!(err.status_code(), StatusCode::RegionBusy);
@@ -977,7 +1214,7 @@ mod tests {
             CurrentEngineTest {
                 region_id,
                 current_region_status: Some(RegionEngineWithStatus::Ready(engine.clone())),
-                region_change: RegionChange::Register(engine.name().to_string(), false),
+                region_change: RegionChange::Register(RegionAttribute::Mito),
                 assert: Box::new(|result| {
                     let current_engine = result.unwrap();
                     assert_matches!(current_engine, CurrentEngine::Engine(_));

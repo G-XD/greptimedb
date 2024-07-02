@@ -26,11 +26,12 @@ use std::sync::Arc;
 
 use catalog::CatalogManagerRef;
 use common_error::ext::BoxedError;
+use common_meta::cache::TableRouteCacheRef;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
 use common_meta::ddl::ProcedureExecutorRef;
+use common_meta::key::flow::{FlowMetadataManager, FlowMetadataManagerRef};
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::KvBackendRef;
-use common_meta::table_name::TableName;
 use common_query::Output;
 use common_telemetry::tracing;
 use common_time::range::TimestampRange;
@@ -48,6 +49,7 @@ use sql::statements::OptionMap;
 use sql::util::format_raw_object_name;
 use sqlparser::ast::ObjectName;
 use table::requests::{CopyDatabaseRequest, CopyDirection, CopyTableRequest};
+use table::table_name::TableName;
 use table::table_reference::TableReference;
 use table::TableRef;
 
@@ -65,10 +67,13 @@ pub struct StatementExecutor {
     query_engine: QueryEngineRef,
     procedure_executor: ProcedureExecutorRef,
     table_metadata_manager: TableMetadataManagerRef,
+    flow_metadata_manager: FlowMetadataManagerRef,
     partition_manager: PartitionRuleManagerRef,
     cache_invalidator: CacheInvalidatorRef,
     inserter: InserterRef,
 }
+
+pub type StatementExecutorRef = Arc<StatementExecutor>;
 
 impl StatementExecutor {
     pub fn new(
@@ -78,13 +83,15 @@ impl StatementExecutor {
         kv_backend: KvBackendRef,
         cache_invalidator: CacheInvalidatorRef,
         inserter: InserterRef,
+        table_route_cache: TableRouteCacheRef,
     ) -> Self {
         Self {
             catalog_manager,
             query_engine,
             procedure_executor,
             table_metadata_manager: Arc::new(TableMetadataManager::new(kv_backend.clone())),
-            partition_manager: Arc::new(PartitionRuleManager::new(kv_backend)),
+            flow_metadata_manager: Arc::new(FlowMetadataManager::new(kv_backend.clone())),
+            partition_manager: Arc::new(PartitionRuleManager::new(kv_backend, table_route_cache)),
             cache_invalidator,
             inserter,
         }
@@ -164,24 +171,39 @@ impl StatementExecutor {
                 let _ = self.create_external_table(stmt, query_ctx).await?;
                 Ok(Output::new_with_affected_rows(0))
             }
-            Statement::CreateFlow(stmt) => {
-                self.create_flow(stmt, query_ctx).await?;
+            Statement::CreateFlow(stmt) => self.create_flow(stmt, query_ctx).await,
+            Statement::DropFlow(stmt) => {
+                self.drop_flow(
+                    query_ctx.current_catalog().to_string(),
+                    format_raw_object_name(stmt.flow_name()),
+                    stmt.drop_if_exists(),
+                    query_ctx,
+                )
+                .await
+            }
+            Statement::CreateView(stmt) => {
+                let _ = self.create_view(stmt, query_ctx).await?;
                 Ok(Output::new_with_affected_rows(0))
             }
             Statement::Alter(alter_table) => self.alter_table(alter_table, query_ctx).await,
             Statement::DropTable(stmt) => {
-                let (catalog, schema, table) =
-                    table_idents_to_full_name(stmt.table_name(), &query_ctx)
-                        .map_err(BoxedError::new)
-                        .context(error::ExternalSnafu)?;
-                let table_name = TableName::new(catalog, schema, table);
-                self.drop_table(table_name, stmt.drop_if_exists()).await
+                let mut table_names = Vec::with_capacity(stmt.table_names().len());
+                for table_name_stmt in stmt.table_names() {
+                    let (catalog, schema, table) =
+                        table_idents_to_full_name(table_name_stmt, &query_ctx)
+                            .map_err(BoxedError::new)
+                            .context(ExternalSnafu)?;
+                    table_names.push(TableName::new(catalog, schema, table));
+                }
+                self.drop_tables(&table_names[..], stmt.drop_if_exists(), query_ctx.clone())
+                    .await
             }
             Statement::DropDatabase(stmt) => {
                 self.drop_database(
                     query_ctx.current_catalog().to_string(),
                     format_raw_object_name(stmt.name()),
                     stmt.drop_if_exists(),
+                    query_ctx,
                 )
                 .await
             }
@@ -189,15 +211,16 @@ impl StatementExecutor {
                 let (catalog, schema, table) =
                     table_idents_to_full_name(stmt.table_name(), &query_ctx)
                         .map_err(BoxedError::new)
-                        .context(error::ExternalSnafu)?;
+                        .context(ExternalSnafu)?;
                 let table_name = TableName::new(catalog, schema, table);
-                self.truncate_table(table_name).await
+                self.truncate_table(table_name, query_ctx).await
             }
             Statement::CreateDatabase(stmt) => {
                 self.create_database(
-                    query_ctx.current_catalog(),
                     &format_raw_object_name(&stmt.name),
                     stmt.if_not_exists,
+                    stmt.options.into_map(),
+                    query_ctx,
                 )
                 .await
             }
@@ -205,17 +228,55 @@ impl StatementExecutor {
                 let (catalog, schema, table) =
                     table_idents_to_full_name(&show.table_name, &query_ctx)
                         .map_err(BoxedError::new)
-                        .context(error::ExternalSnafu)?;
+                        .context(ExternalSnafu)?;
 
                 let table_ref = self
                     .catalog_manager
                     .table(&catalog, &schema, &table)
                     .await
-                    .context(error::CatalogSnafu)?
-                    .context(error::TableNotFoundSnafu { table_name: &table })?;
+                    .context(CatalogSnafu)?
+                    .context(TableNotFoundSnafu { table_name: &table })?;
                 let table_name = TableName::new(catalog, schema, table);
 
                 self.show_create_table(table_name, table_ref, query_ctx)
+                    .await
+            }
+            Statement::ShowCreateFlow(show) => {
+                let obj_name = &show.flow_name;
+                let (catalog_name, flow_name) = match &obj_name.0[..] {
+                    [table] => (query_ctx.current_catalog().to_string(), table.value.clone()),
+                    [catalog, table] => (catalog.value.clone(), table.value.clone()),
+                    _ => {
+                        return InvalidSqlSnafu {
+                            err_msg: format!(
+                "expect flow name to be <catalog>.<flow_name> or <flow_name>, actual: {obj_name}",
+            ),
+                        }
+                        .fail()
+                    }
+                };
+
+                let flow_name_val = self
+                    .flow_metadata_manager
+                    .flow_name_manager()
+                    .get(&catalog_name, &flow_name)
+                    .await
+                    .context(error::TableMetadataManagerSnafu)?
+                    .context(error::FlowNotFoundSnafu {
+                        flow_name: &flow_name,
+                    })?;
+
+                let flow_val = self
+                    .flow_metadata_manager
+                    .flow_info_manager()
+                    .get(flow_name_val.flow_id())
+                    .await
+                    .context(error::TableMetadataManagerSnafu)?
+                    .context(error::FlowNotFoundSnafu {
+                        flow_name: &flow_name,
+                    })?;
+
+                self.show_create_flow(obj_name.clone(), flow_val, query_ctx)
                     .await
             }
             Statement::SetVariables(set_var) => {
@@ -245,6 +306,7 @@ impl StatementExecutor {
                 self.show_columns(show_columns, query_ctx).await
             }
             Statement::ShowIndex(show_index) => self.show_index(show_index, query_ctx).await,
+            Statement::ShowStatus(_) => self.show_status(query_ctx).await,
         }
     }
 
@@ -257,6 +319,13 @@ impl StatementExecutor {
             .planner()
             .plan(stmt, query_ctx)
             .await
+            .context(PlanStatementSnafu)
+    }
+
+    pub fn optimize_logical_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.query_engine
+            .planner()
+            .optimize(plan)
             .context(PlanStatementSnafu)
     }
 
@@ -296,6 +365,7 @@ fn to_copy_table_request(stmt: CopyTable, query_ctx: QueryContextRef) -> Result<
         connection,
         with,
         table_name,
+        limit,
         ..
     } = match stmt {
         CopyTable::To(arg) => arg,
@@ -322,6 +392,7 @@ fn to_copy_table_request(stmt: CopyTable, query_ctx: QueryContextRef) -> Result<
         pattern,
         direction,
         timestamp_range,
+        limit,
     })
 }
 
@@ -422,7 +493,8 @@ mod tests {
     fn check_timestamp_range((start, end): (&str, &str)) -> error::Result<Option<TimestampRange>> {
         let query_ctx = QueryContextBuilder::default()
             .timezone(Arc::new(Timezone::from_tz_string("Asia/Shanghai").unwrap()))
-            .build();
+            .build()
+            .into();
         let map = OptionMap::from(
             [
                 (COPY_DATABASE_TIME_START_KEY.to_string(), start.to_string()),

@@ -24,6 +24,8 @@ use sql::dialect::GreptimeDbDialect;
 use sql::parser::ParserContext;
 use sql::statements::create::{CreateTable, TIME_INDEX};
 use sql::statements::{self, OptionMap};
+use sqlparser::ast::KeyOrIndexDisplay;
+use store_api::metric_engine_consts::{is_metric_engine, is_metric_engine_internal_column};
 use table::metadata::{TableInfoRef, TableMeta};
 use table::requests::{FILE_TABLE_META_KEY, TTL_KEY, WRITE_BUFFER_SIZE_KEY};
 
@@ -96,6 +98,7 @@ fn create_column_def(column_schema: &ColumnSchema, quote_style: char) -> Result<
 }
 
 fn create_table_constraints(
+    engine: &str,
     schema: &SchemaRef,
     table_meta: &TableMeta,
     quote_style: char,
@@ -106,20 +109,32 @@ fn create_table_constraints(
         constraints.push(TableConstraint::Unique {
             name: Some(TIME_INDEX.into()),
             columns: vec![Ident::with_quote(quote_style, column_name)],
-            is_primary: false,
             characteristics: None,
+            index_name: None,
+            index_type_display: KeyOrIndexDisplay::None,
+            index_type: None,
+            index_options: vec![],
         });
     }
     if !table_meta.primary_key_indices.is_empty() {
+        let is_metric_engine = is_metric_engine(engine);
         let columns = table_meta
             .row_key_column_names()
-            .map(|name| Ident::with_quote(quote_style, name))
+            .flat_map(|name| {
+                if is_metric_engine && is_metric_engine_internal_column(name) {
+                    None
+                } else {
+                    Some(Ident::with_quote(quote_style, name))
+                }
+            })
             .collect();
-        constraints.push(TableConstraint::Unique {
+        constraints.push(TableConstraint::PrimaryKey {
             name: None,
             columns,
-            is_primary: true,
             characteristics: None,
+            index_name: None,
+            index_type: None,
+            index_options: vec![],
         });
     }
 
@@ -131,14 +146,20 @@ pub fn create_table_stmt(table_info: &TableInfoRef, quote_style: char) -> Result
     let table_meta = &table_info.meta;
     let table_name = &table_info.name;
     let schema = &table_info.meta.schema;
-
+    let is_metric_engine = is_metric_engine(&table_meta.engine);
     let columns = schema
         .column_schemas()
         .iter()
-        .map(|c| create_column_def(c, quote_style))
+        .filter_map(|c| {
+            if is_metric_engine && is_metric_engine_internal_column(&c.name) {
+                None
+            } else {
+                Some(create_column_def(c, quote_style))
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
 
-    let constraints = create_table_constraints(schema, table_meta, quote_style);
+    let constraints = create_table_constraints(&table_meta.engine, schema, table_meta, quote_style);
 
     Ok(CreateTable {
         if_not_exists: true,

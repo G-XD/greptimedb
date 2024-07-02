@@ -12,35 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod check;
 mod metadata;
 
 use std::collections::BTreeMap;
 
 use api::v1::flow::flow_request::Body as PbFlowRequest;
-use api::v1::flow::{CreateRequest, FlowRequest};
+use api::v1::flow::{CreateRequest, FlowRequest, FlowRequestHeader};
+use api::v1::ExpireAfter;
 use async_trait::async_trait;
+use common_catalog::format_full_flow_name;
 use common_procedure::error::{FromJsonSnafu, ToJsonSnafu};
 use common_procedure::{
     Context as ProcedureContext, LockKey, Procedure, Result as ProcedureResult, Status,
 };
 use common_telemetry::info;
+use common_telemetry::tracing_context::TracingContext;
 use futures::future::join_all;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
+use snafu::{ensure, ResultExt};
 use strum::AsRefStr;
 use table::metadata::TableId;
 
 use super::utils::add_peer_context_if_needed;
+use crate::cache_invalidator::Context;
 use crate::ddl::utils::handle_retry_error;
 use crate::ddl::DdlContext;
-use crate::error::Result;
+use crate::error::{self, Result};
+use crate::instruction::{CacheIdent, CreateFlow};
 use crate::key::flow::flow_info::FlowInfoValue;
+use crate::key::table_name::TableNameKey;
 use crate::key::FlowId;
 use crate::lock_key::{CatalogLock, FlowNameLock, TableNameLock};
 use crate::peer::Peer;
-use crate::rpc::ddl::CreateFlowTask;
+use crate::rpc::ddl::{CreateFlowTask, QueryContext};
 use crate::{metrics, ClusterId};
 
 /// The procedure of flow creation.
@@ -53,7 +58,12 @@ impl CreateFlowProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::CreateFlow";
 
     /// Returns a new [CreateFlowProcedure].
-    pub fn new(cluster_id: ClusterId, task: CreateFlowTask, context: DdlContext) -> Self {
+    pub fn new(
+        cluster_id: ClusterId,
+        task: CreateFlowTask,
+        query_context: QueryContext,
+        context: DdlContext,
+    ) -> Self {
         Self {
             context,
             data: CreateFlowData {
@@ -62,7 +72,8 @@ impl CreateFlowProcedure {
                 flow_id: None,
                 peers: vec![],
                 source_table_ids: vec![],
-                state: CreateFlowState::CreateMetadata,
+                query_context,
+                state: CreateFlowState::Prepare,
             },
         }
     }
@@ -73,8 +84,48 @@ impl CreateFlowProcedure {
         Ok(CreateFlowProcedure { context, data })
     }
 
-    async fn on_prepare(&mut self) -> Result<Status> {
-        self.check_creation().await?;
+    pub(crate) async fn on_prepare(&mut self) -> Result<Status> {
+        let catalog_name = &self.data.task.catalog_name;
+        let flow_name = &self.data.task.flow_name;
+        let sink_table_name = &self.data.task.sink_table_name;
+        let create_if_not_exists = self.data.task.create_if_not_exists;
+
+        let flow_name_value = self
+            .context
+            .flow_metadata_manager
+            .flow_name_manager()
+            .get(catalog_name, flow_name)
+            .await?;
+
+        if let Some(value) = flow_name_value {
+            ensure!(
+                create_if_not_exists,
+                error::FlowAlreadyExistsSnafu {
+                    flow_name: format_full_flow_name(catalog_name, flow_name),
+                }
+            );
+
+            let flow_id = value.flow_id();
+            return Ok(Status::done_with_output(flow_id));
+        }
+
+        //  Ensures sink table doesn't exist.
+        let exists = self
+            .context
+            .table_metadata_manager
+            .table_name_manager()
+            .exists(TableNameKey::new(
+                &sink_table_name.catalog_name,
+                &sink_table_name.schema_name,
+                &sink_table_name.table_name,
+            ))
+            .await?;
+        // TODO(discord9): due to undefined behavior in flow's plan in how to transform types in mfp, sometime flow can't deduce correct schema
+        // and require manually create sink table
+        if exists {
+            common_telemetry::warn!("Table already exists, table: {}", sink_table_name);
+        }
+
         self.collect_source_tables().await?;
         self.allocate_flow_id().await?;
         self.data.state = CreateFlowState::CreateFlows;
@@ -88,6 +139,10 @@ impl CreateFlowProcedure {
         for peer in &self.data.peers {
             let requester = self.context.node_manager.flownode(peer).await;
             let request = FlowRequest {
+                header: Some(FlowRequestHeader {
+                    tracing_context: TracingContext::from_current_span().to_w3c(),
+                    query_context: Some(self.data.query_context.clone().into()),
+                }),
                 body: Some(PbFlowRequest::Create((&self.data).into())),
             };
             create_flow.push(async move {
@@ -120,6 +175,28 @@ impl CreateFlowProcedure {
             .create_flow_metadata(flow_id, (&self.data).into())
             .await?;
         info!("Created flow metadata for flow {flow_id}");
+        self.data.state = CreateFlowState::InvalidateFlowCache;
+        Ok(Status::executing(true))
+    }
+
+    async fn on_broadcast(&mut self) -> Result<Status> {
+        // Safety: The flow id must be allocated.
+        let flow_id = self.data.flow_id.unwrap();
+        let ctx = Context {
+            subject: Some("Invalidate flow cache by creating flow".to_string()),
+        };
+
+        self.context
+            .cache_invalidator
+            .invalidate(
+                &ctx,
+                &[CacheIdent::CreateFlow(CreateFlow {
+                    source_table_ids: self.data.source_table_ids.clone(),
+                    flownode_ids: self.data.peers.iter().map(|peer| peer.id).collect(),
+                })],
+            )
+            .await?;
+
         Ok(Status::done_with_output(flow_id))
     }
 }
@@ -141,6 +218,7 @@ impl Procedure for CreateFlowProcedure {
             CreateFlowState::Prepare => self.on_prepare().await,
             CreateFlowState::CreateFlows => self.on_flownode_create_flows().await,
             CreateFlowState::CreateMetadata => self.on_create_metadata().await,
+            CreateFlowState::InvalidateFlowCache => self.on_broadcast().await,
         }
         .map_err(handle_retry_error)
     }
@@ -174,6 +252,8 @@ pub enum CreateFlowState {
     Prepare,
     /// Creates flows on the flownode.
     CreateFlows,
+    /// Invalidate flow cache.
+    InvalidateFlowCache,
     /// Create metadata.
     CreateMetadata,
 }
@@ -187,6 +267,7 @@ pub struct CreateFlowData {
     pub(crate) flow_id: Option<FlowId>,
     pub(crate) peers: Vec<Peer>,
     pub(crate) source_table_ids: Vec<TableId>,
+    pub(crate) query_context: QueryContext,
 }
 
 impl From<&CreateFlowData> for CreateRequest {
@@ -195,7 +276,7 @@ impl From<&CreateFlowData> for CreateRequest {
         let source_table_ids = &value.source_table_ids;
 
         CreateRequest {
-            flow_id: Some(api::v1::flow::TaskId { id: flow_id }),
+            flow_id: Some(api::v1::FlowId { id: flow_id }),
             source_table_ids: source_table_ids
                 .iter()
                 .map(|table_id| api::v1::TableId { id: *table_id })
@@ -203,7 +284,7 @@ impl From<&CreateFlowData> for CreateRequest {
             sink_table_name: Some(value.task.sink_table_name.clone().into()),
             // Always be true
             create_if_not_exists: true,
-            expire_when: value.task.expire_when.clone(),
+            expire_after: value.task.expire_after.map(|value| ExpireAfter { value }),
             comment: value.task.comment.clone(),
             sql: value.task.sql.clone(),
             flow_options: value.task.flow_options.clone(),
@@ -217,7 +298,7 @@ impl From<&CreateFlowData> for FlowInfoValue {
             catalog_name,
             flow_name,
             sink_table_name,
-            expire_when,
+            expire_after,
             comment,
             sql,
             flow_options: options,
@@ -238,7 +319,7 @@ impl From<&CreateFlowData> for FlowInfoValue {
             catalog_name,
             flow_name,
             raw_sql: sql,
-            expire_when,
+            expire_after,
             comment,
             options,
         }

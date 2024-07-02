@@ -13,103 +13,132 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use common_query::error as query_error;
-use common_query::error::Result as QueryResult;
-use common_query::physical_plan::{Partitioning, PhysicalPlan, PhysicalPlanRef};
-use common_recordbatch::adapter::RecordBatchMetrics;
-use common_recordbatch::error::Result as RecordBatchResult;
-use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream, SendableRecordBatchStream};
+use common_error::ext::BoxedError;
+use common_recordbatch::{DfRecordBatch, DfSendableRecordBatchStream, SendableRecordBatchStream};
 use common_telemetry::tracing::Span;
 use common_telemetry::tracing_context::TracingContext;
+use datafusion::error::Result as DfResult;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::{ExecutionMode, PlanProperties};
-use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortExpr};
-use datatypes::schema::SchemaRef;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
+    RecordBatchStream as DfRecordBatchStream,
+};
+use datafusion_common::DataFusionError;
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
+use datatypes::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::{Stream, StreamExt};
-use snafu::OptionExt;
+use store_api::region_engine::{PartitionRange, RegionScannerRef};
 
 use crate::table::metrics::MemoryUsageMetrics;
 
-/// Adapt greptime's [SendableRecordBatchStream] to GreptimeDB's [PhysicalPlan].
-pub struct StreamScanAdapter {
-    stream: Mutex<Option<SendableRecordBatchStream>>,
-    schema: SchemaRef,
+/// A plan to read multiple partitions from a region of a table.
+#[derive(Debug)]
+pub struct RegionScanExec {
+    scanner: Mutex<RegionScannerRef>,
+    arrow_schema: ArrowSchemaRef,
+    /// The expected output ordering for the plan.
     output_ordering: Option<Vec<PhysicalSortExpr>>,
     metric: ExecutionPlanMetricsSet,
     properties: PlanProperties,
 }
 
-impl Debug for StreamScanAdapter {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamScanAdapter")
-            .field("stream", &"<SendableRecordBatchStream>")
-            .field("schema", &self.schema.arrow_schema().fields)
-            .finish()
-    }
-}
-
-impl StreamScanAdapter {
-    pub fn new(stream: SendableRecordBatchStream) -> Self {
-        let schema = stream.schema();
+impl RegionScanExec {
+    pub fn new(scanner: RegionScannerRef) -> Self {
+        let arrow_schema = scanner.schema().arrow_schema().clone();
+        let scanner_props = scanner.properties();
+        let mut num_output_partition = scanner_props.num_partitions();
+        // The meaning of word "partition" is different in different context. For datafusion
+        // it's about "parallelism" and for storage it's about "data range". Thus here we add
+        // a special case to handle the situation where the number of storage partition is 0.
+        if num_output_partition == 0 {
+            num_output_partition = 1;
+        }
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.arrow_schema().clone()),
-            Partitioning::UnknownPartitioning(1),
+            EquivalenceProperties::new(arrow_schema.clone()),
+            Partitioning::UnknownPartitioning(num_output_partition),
             ExecutionMode::Bounded,
         );
         Self {
-            stream: Mutex::new(Some(stream)),
-            schema,
+            scanner: Mutex::new(scanner),
+            arrow_schema,
             output_ordering: None,
             metric: ExecutionPlanMetricsSet::new(),
             properties,
         }
     }
 
+    /// Set the expected output ordering for the plan.
     pub fn with_output_ordering(mut self, output_ordering: Vec<PhysicalSortExpr>) -> Self {
         self.output_ordering = Some(output_ordering);
         self
     }
+
+    /// Get the partition ranges of the scanner. This method will collapse the ranges into
+    /// a single vector.
+    pub fn get_partition_ranges(&self) -> Vec<PartitionRange> {
+        let scanner = self.scanner.lock().unwrap();
+        let raw_ranges = &scanner.properties().partitions;
+
+        // collapse the ranges
+        let mut ranges = Vec::with_capacity(raw_ranges.len());
+        for partition in raw_ranges {
+            ranges.extend_from_slice(partition);
+        }
+
+        ranges
+    }
+
+    /// Update the partition ranges of underlying scanner.
+    pub fn set_partitions(&self, partitions: Vec<Vec<PartitionRange>>) -> Result<(), BoxedError> {
+        let mut scanner = self.scanner.lock().unwrap();
+        scanner.prepare(partitions)
+    }
 }
 
-impl PhysicalPlan for StreamScanAdapter {
+impl ExecutionPlan for RegionScanExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn schema(&self) -> ArrowSchemaRef {
+        self.arrow_schema.clone()
     }
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
 
-    fn children(&self) -> Vec<PhysicalPlanRef> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
-    fn with_new_children(&self, _children: Vec<PhysicalPlanRef>) -> QueryResult<PhysicalPlanRef> {
-        Ok(Arc::new(Self::new(
-            self.stream.lock().unwrap().take().unwrap(),
-        )))
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
     }
 
     fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> QueryResult<SendableRecordBatchStream> {
+    ) -> datafusion_common::Result<DfSendableRecordBatchStream> {
         let tracing_context = TracingContext::from_json(context.session_id().as_str());
-        let span = tracing_context.attach(common_telemetry::tracing::info_span!("stream_adapter"));
+        let span =
+            tracing_context.attach(common_telemetry::tracing::info_span!("read_from_region"));
 
-        let mut stream = self.stream.lock().unwrap();
-        let stream = stream.take().context(query_error::ExecuteRepeatedlySnafu)?;
+        let stream = self
+            .scanner
+            .lock()
+            .unwrap()
+            .scan_partition(partition)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let mem_usage_metrics = MemoryUsageMetrics::new(&self.metric, partition);
         Ok(Box::pin(StreamWithMetricWrapper {
             stream,
@@ -123,6 +152,16 @@ impl PhysicalPlan for StreamScanAdapter {
     }
 }
 
+impl DisplayAs for RegionScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // The scanner contains all information needed to display the plan.
+        match self.scanner.try_lock() {
+            Ok(scanner) => scanner.fmt_as(t, f),
+            Err(_) => write!(f, "RegionScanExec <locked>"),
+        }
+    }
+}
+
 pub struct StreamWithMetricWrapper {
     stream: SendableRecordBatchStream,
     metric: MemoryUsageMetrics,
@@ -130,49 +169,54 @@ pub struct StreamWithMetricWrapper {
 }
 
 impl Stream for StreamWithMetricWrapper {
-    type Item = RecordBatchResult<RecordBatch>;
+    type Item = DfResult<DfRecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let _enter = this.span.enter();
-        let poll = this.stream.poll_next_unpin(cx);
-        if let Poll::Ready(Some(Ok(record_batch))) = &poll {
-            let batch_mem_size = record_batch
-                .columns()
-                .iter()
-                .map(|vec_ref| vec_ref.memory_size())
-                .sum::<usize>();
-            // we don't record elapsed time here
-            // since it's calling storage api involving I/O ops
-            this.metric.record_mem_usage(batch_mem_size);
-            this.metric.record_output(record_batch.num_rows());
+        match this.stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(result)) => match result {
+                Ok(record_batch) => {
+                    let batch_mem_size = record_batch
+                        .columns()
+                        .iter()
+                        .map(|vec_ref| vec_ref.memory_size())
+                        .sum::<usize>();
+                    // we don't record elapsed time here
+                    // since it's calling storage api involving I/O ops
+                    this.metric.record_mem_usage(batch_mem_size);
+                    this.metric.record_output(record_batch.num_rows());
+                    Poll::Ready(Some(Ok(record_batch.into_df_record_batch())))
+                }
+                Err(e) => Poll::Ready(Some(Err(DataFusionError::External(Box::new(e))))),
+            },
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
+    }
 
-        poll
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }
 
-impl RecordBatchStream for StreamWithMetricWrapper {
-    fn schema(&self) -> SchemaRef {
-        self.stream.schema()
-    }
-
-    fn metrics(&self) -> Option<RecordBatchMetrics> {
-        self.stream.metrics()
-    }
-
-    fn output_ordering(&self) -> Option<&[OrderOption]> {
-        self.stream.output_ordering()
+impl DfRecordBatchStream for StreamWithMetricWrapper {
+    fn schema(&self) -> ArrowSchemaRef {
+        self.stream.schema().arrow_schema().clone()
     }
 }
 
 #[cfg(test)]
 mod test {
-    use common_recordbatch::{util, RecordBatch, RecordBatches};
+    use std::sync::Arc;
+
+    use common_recordbatch::{RecordBatch, RecordBatches};
     use datafusion::prelude::SessionContext;
     use datatypes::data_type::ConcreteDataType;
-    use datatypes::schema::{ColumnSchema, Schema};
+    use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
     use datatypes::vectors::Int32Vector;
+    use futures::TryStreamExt;
+    use store_api::region_engine::SinglePartitionScanner;
 
     use super::*;
 
@@ -200,9 +244,10 @@ mod test {
             RecordBatches::try_new(schema.clone(), vec![batch1.clone(), batch2.clone()]).unwrap();
         let stream = recordbatches.as_stream();
 
-        let scan = StreamScanAdapter::new(stream);
+        let scanner = Box::new(SinglePartitionScanner::new(stream));
+        let plan = RegionScanExec::new(scanner);
         let actual: SchemaRef = Arc::new(
-            scan.properties
+            plan.properties
                 .eq_properties
                 .schema()
                 .clone()
@@ -211,12 +256,12 @@ mod test {
         );
         assert_eq!(actual, schema);
 
-        let stream = scan.execute(0, ctx.task_ctx()).unwrap();
-        let recordbatches = util::collect(stream).await.unwrap();
-        assert_eq!(recordbatches[0], batch1);
-        assert_eq!(recordbatches[1], batch2);
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let recordbatches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batch1.df_record_batch(), &recordbatches[0]);
+        assert_eq!(batch2.df_record_batch(), &recordbatches[1]);
 
-        let result = scan.execute(0, ctx.task_ctx());
+        let result = plan.execute(0, ctx.task_ctx());
         assert!(result.is_err());
         match result {
             Err(e) => assert!(e

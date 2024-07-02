@@ -16,13 +16,14 @@
 
 use std::sync::Arc;
 
+use api::v1::region::compact_request;
 use common_telemetry::{error, info, warn};
 use store_api::logstore::LogStore;
 use store_api::region_request::RegionFlushRequest;
 use store_api::storage::RegionId;
 
 use crate::config::MitoConfig;
-use crate::error::Result;
+use crate::error::{RegionNotFoundSnafu, Result};
 use crate::flush::{FlushReason, RegionFlushTask};
 use crate::region::MitoRegionRef;
 use crate::request::{FlushFailed, FlushFinished, OnFailure, OptionOutputTx};
@@ -85,8 +86,8 @@ impl<S> RegionWorkerLoop<S> {
         let mut max_mem_region = None;
 
         for region in &regions {
-            if self.flush_scheduler.is_flush_requested(region.region_id) {
-                // Already flushing.
+            if self.flush_scheduler.is_flush_requested(region.region_id) || !region.is_writable() {
+                // Already flushing or not writable.
                 continue;
             }
 
@@ -134,8 +135,8 @@ impl<S> RegionWorkerLoop<S> {
         let min_last_flush_time = now - self.config.auto_flush_interval.as_millis() as i64;
 
         for region in &regions {
-            if self.flush_scheduler.is_flush_requested(region.region_id) {
-                // Already flushing.
+            if self.flush_scheduler.is_flush_requested(region.region_id) || !region.is_writable() {
+                // Already flushing or not writable.
                 continue;
             }
 
@@ -172,7 +173,6 @@ impl<S> RegionWorkerLoop<S> {
             senders: Vec::new(),
             request_sender: self.sender.clone(),
             access_layer: region.access_layer.clone(),
-            file_purger: region.file_purger.clone(),
             listener: self.listener.clone(),
             engine_config,
             row_group_size,
@@ -190,13 +190,23 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         region_id: RegionId,
         mut request: FlushFinished,
     ) {
-        let Some(region) = self.regions.writable_region_or(region_id, &mut request) else {
-            warn!(
-                "Unable to finish the flush task for a read only region {}",
-                region_id
-            );
-            return;
+        // Notifies other workers. Even the remaining steps of this method fail we still
+        // wake up other workers as we have released some memory by flush.
+        self.notify_group();
+
+        let region = match self.regions.get_region(region_id) {
+            Some(region) => region,
+            None => {
+                request.on_failure(RegionNotFoundSnafu { region_id }.build());
+                return;
+            }
         };
+
+        region.version_control.apply_edit(
+            request.edit.clone(),
+            &request.memtables_to_remove,
+            region.file_purger.clone(),
+        );
 
         region.update_flush_millis();
 
@@ -207,7 +217,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         );
         if let Err(e) = self
             .wal
-            .obsolete(region_id, request.flushed_entry_id, &region.wal_options)
+            .obsolete(region_id, request.flushed_entry_id, &region.provider)
             .await
         {
             error!(e; "Failed to write wal, region: {}", region_id);
@@ -229,16 +239,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         // Handle stalled requests.
-        let stalled = std::mem::take(&mut self.stalled_requests);
-        // We already stalled these requests, don't stall them again.
-        self.handle_write_requests(stalled.requests, false).await;
+        self.handle_stalled_requests().await;
 
         // Schedules compaction.
         if let Err(e) = self.compaction_scheduler.schedule_compaction(
             region.region_id,
+            compact_request::Options::Regular(Default::default()),
             &region.version_control,
             &region.access_layer,
-            &region.file_purger,
             OptionOutputTx::none(),
             &region.manifest_ctx,
         ) {

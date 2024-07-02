@@ -13,16 +13,15 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::HeaderValue;
 use common_base::Plugins;
 use common_telemetry::metric::{convert_metric_to_write_request, MetricFilter};
 use common_telemetry::{error, info};
 use common_time::Timestamp;
-use hyper::HeaderMap;
 use prost::Message;
-use reqwest::header::HeaderName;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use session::context::QueryContextBuilder;
 use snafu::{ensure, ResultExt};
@@ -114,7 +113,7 @@ impl ExportMetricsTask {
                 }
             );
         }
-        let mut headers = reqwest::header::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         if let Some(remote_write) = &config.remote_write {
             ensure!(
                 !remote_write.url.is_empty(),
@@ -227,7 +226,7 @@ pub async fn write_system_metric_by_network(
                     error!("report export metrics error, msg: {:#?}", resp);
                 }
             }
-            Err(e) => error!("report export metrics failed, error {}", e),
+            Err(e) => error!(e; "report export metrics failed"),
         };
     }
 }
@@ -247,7 +246,7 @@ pub async fn write_system_metric_by_handler(
     );
     // Pass the first tick. Because the first tick completes immediately.
     interval.tick().await;
-    let ctx = QueryContextBuilder::default().current_schema(db).build();
+    let ctx = Arc::new(QueryContextBuilder::default().current_schema(db).build());
     loop {
         interval.tick().await;
         let metric_families = prometheus::gather();
@@ -266,7 +265,7 @@ pub async fn write_system_metric_by_handler(
         };
 
         if let Err(e) = handler.write(requests, ctx.clone(), false).await {
-            error!("report export metrics by handler failed, error {}", e);
+            error!(e; "report export metrics by handler failed");
         } else {
             crate::metrics::PROM_STORE_REMOTE_WRITE_SAMPLES.inc_by(samples as u64);
         }

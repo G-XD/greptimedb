@@ -22,6 +22,7 @@ use auth::UserProviderRef;
 use axum::Router;
 use catalog::kvbackend::KvBackendCatalogManager;
 use common_base::secrets::ExposeSecret;
+use common_config::Configurable;
 use common_meta::key::catalog_name::CatalogNameKey;
 use common_meta::key::schema_name::SchemaNameKey;
 use common_runtime::Builder as RuntimeBuilder;
@@ -33,7 +34,6 @@ use datanode::config::{
     AzblobConfig, DatanodeOptions, FileConfig, GcsConfig, ObjectStoreConfig, OssConfig, S3Config,
     StorageConfig,
 };
-use frontend::frontend::TomlSerializable;
 use frontend::instance::Instance;
 use frontend::service_config::{MysqlOptions, PostgresOptions};
 use futures::future::BoxFuture;
@@ -42,7 +42,7 @@ use object_store::test_util::TempFolder;
 use object_store::ObjectStore;
 use servers::grpc::builder::GrpcServerBuilder;
 use servers::grpc::greptime_handler::GreptimeRequestHandler;
-use servers::grpc::{GrpcServer, GrpcServerConfig};
+use servers::grpc::{GrpcOptions, GrpcServer, GrpcServerConfig};
 use servers::http::{HttpOptions, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
@@ -347,6 +347,7 @@ pub(crate) fn create_datanode_opts(
             providers,
             store: default_store,
         },
+        grpc: GrpcOptions::default().with_addr(PEER_PLACEHOLDER_ADDR),
         mode,
         wal: wal_config,
         ..Default::default()
@@ -392,7 +393,7 @@ pub async fn setup_test_http_app(store_type: StorageType, name: &str) -> (Router
             None,
         )
         .with_metrics_handler(MetricsHandler)
-        .with_greptime_config_options(instance.mix_options.datanode.to_toml_string())
+        .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
         .build();
     (http_server.build(http_server.make_app()), instance.guard)
 }
@@ -425,7 +426,7 @@ pub async fn setup_test_http_app_with_frontend_and_user_provider(
             ServerSqlQueryHandlerAdapter::arc(instance.instance.clone()),
             Some(instance.instance.clone()),
         )
-        .with_greptime_config_options(instance.mix_options.to_toml().unwrap());
+        .with_greptime_config_options(instance.opts.to_toml().unwrap());
 
     if let Some(user_provider) = user_provider {
         http_server = http_server.with_user_provider(user_provider);
@@ -464,7 +465,7 @@ pub async fn setup_test_prom_app_with_frontend(
         )
         .with_prom_handler(frontend_ref.clone(), true, is_strict_mode)
         .with_prometheus_handler(frontend_ref)
-        .with_greptime_config_options(instance.mix_options.datanode.to_toml_string())
+        .with_greptime_config_options(instance.opts.datanode_options().to_toml().unwrap())
         .build();
     let app = http_server.build(http_server.make_app());
     (app, instance.guard)
@@ -506,18 +507,20 @@ pub async fn setup_grpc_server_with(
     let greptime_request_handler = GreptimeRequestHandler::new(
         ServerGrpcQueryHandlerAdapter::arc(fe_instance_ref.clone()),
         user_provider.clone(),
-        runtime.clone(),
+        Some(runtime.clone()),
     );
 
     let flight_handler = Arc::new(greptime_request_handler.clone());
 
-    let fe_grpc_server = Arc::new(
-        GrpcServerBuilder::new(grpc_config.unwrap_or_default(), runtime)
-            .database_handler(greptime_request_handler)
-            .flight_handler(flight_handler)
-            .prometheus_handler(fe_instance_ref.clone(), user_provider)
-            .build(),
-    );
+    let grpc_config = grpc_config.unwrap_or_default();
+    let grpc_builder = GrpcServerBuilder::new(grpc_config.clone(), runtime)
+        .database_handler(greptime_request_handler)
+        .flight_handler(flight_handler)
+        .prometheus_handler(fe_instance_ref.clone(), user_provider)
+        .with_tls_config(grpc_config.tls)
+        .unwrap();
+
+    let fe_grpc_server = Arc::new(grpc_builder.build());
 
     let fe_grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let fe_grpc_addr = fe_grpc_server

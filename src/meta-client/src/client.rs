@@ -41,6 +41,7 @@ use common_meta::rpc::store::{
     BatchPutResponse, CompareAndPutRequest, CompareAndPutResponse, DeleteRangeRequest,
     DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse,
 };
+use common_meta::ClusterId;
 use common_telemetry::info;
 use heartbeat::Client as HeartbeatClient;
 use lock::Client as LockClient;
@@ -64,7 +65,6 @@ pub struct MetaClientBuilder {
     id: Id,
     role: Role,
     enable_heartbeat: bool,
-    enable_router: bool,
     enable_store: bool,
     enable_lock: bool,
     enable_procedure: bool,
@@ -75,7 +75,7 @@ pub struct MetaClientBuilder {
 }
 
 impl MetaClientBuilder {
-    pub fn new(cluster_id: u64, member_id: u64, role: Role) -> Self {
+    pub fn new(cluster_id: ClusterId, member_id: u64, role: Role) -> Self {
         Self {
             id: (cluster_id, member_id),
             role,
@@ -83,16 +83,33 @@ impl MetaClientBuilder {
         }
     }
 
+    /// Returns the role of Frontend's default options.
+    pub fn frontend_default_options(cluster_id: ClusterId) -> Self {
+        // Frontend does not need a member id.
+        Self::new(cluster_id, 0, Role::Frontend)
+            .enable_store()
+            .enable_heartbeat()
+            .enable_procedure()
+            .enable_access_cluster_info()
+    }
+
+    /// Returns the role of Datanode's default options.
+    pub fn datanode_default_options(cluster_id: ClusterId, member_id: u64) -> Self {
+        Self::new(cluster_id, member_id, Role::Datanode)
+            .enable_store()
+            .enable_heartbeat()
+    }
+
+    /// Returns the role of Flownode's default options.
+    pub fn flownode_default_options(cluster_id: ClusterId, member_id: u64) -> Self {
+        Self::new(cluster_id, member_id, Role::Flownode)
+            .enable_store()
+            .enable_heartbeat()
+    }
+
     pub fn enable_heartbeat(self) -> Self {
         Self {
             enable_heartbeat: true,
-            ..self
-        }
-    }
-
-    pub fn enable_router(self) -> Self {
-        Self {
-            enable_router: true,
             ..self
         }
     }
@@ -153,10 +170,6 @@ impl MetaClientBuilder {
             MetaClient::new(self.id)
         };
 
-        if !(self.enable_heartbeat || self.enable_router || self.enable_store || self.enable_lock) {
-            panic!("At least one client needs to be enabled.")
-        }
-
         let mgr = client.channel_manager.clone();
 
         if self.enable_heartbeat {
@@ -168,12 +181,15 @@ impl MetaClientBuilder {
                 DEFAULT_ASK_LEADER_MAX_RETRY,
             ));
         }
+
         if self.enable_store {
             client.store = Some(StoreClient::new(self.id, self.role, mgr.clone()));
         }
+
         if self.enable_lock {
             client.lock = Some(LockClient::new(self.id, self.role, mgr.clone()));
         }
+
         if self.enable_procedure {
             let mgr = self.ddl_channel_manager.unwrap_or(mgr.clone());
             client.procedure = Some(ProcedureClient::new(
@@ -183,6 +199,7 @@ impl MetaClientBuilder {
                 DEFAULT_SUBMIT_DDL_MAX_RETRY,
             ));
         }
+
         if self.enable_access_cluster_info {
             client.cluster = Some(ClusterClient::new(
                 self.id,
@@ -265,29 +282,24 @@ impl ClusterInfo for MetaClient {
         let mut nodes = if get_metasrv_nodes {
             let last_activity_ts = -1; // Metasrv does not provide this information.
 
-            // TODO(dennis): Get Metasrv node info
-            let git_commit = "unknown";
-            let version = "unknown";
-            let start_time_ms = 0;
-
             let (leader, followers) = cluster_client.get_metasrv_peers().await?;
             followers
                 .into_iter()
-                .map(|peer| NodeInfo {
-                    peer,
+                .map(|node| NodeInfo {
+                    peer: node.peer.map(|p| p.into()).unwrap_or_default(),
                     last_activity_ts,
                     status: NodeStatus::Metasrv(MetasrvStatus { is_leader: false }),
-                    version: version.to_string(),
-                    git_commit: git_commit.to_string(),
-                    start_time_ms,
+                    version: node.version,
+                    git_commit: node.git_commit,
+                    start_time_ms: node.start_time_ms,
                 })
-                .chain(leader.into_iter().map(|leader| NodeInfo {
-                    peer: leader,
+                .chain(leader.into_iter().map(|node| NodeInfo {
+                    peer: node.peer.map(|p| p.into()).unwrap_or_default(),
                     last_activity_ts,
                     status: NodeStatus::Metasrv(MetasrvStatus { is_leader: true }),
-                    version: version.to_string(),
-                    git_commit: git_commit.to_string(),
-                    start_time_ms,
+                    version: node.version,
+                    git_commit: node.git_commit,
+                    start_time_ms: node.start_time_ms,
                 }))
                 .collect::<Vec<_>>()
         } else {
@@ -583,9 +595,7 @@ mod tests {
         assert!(meta_client.store_client().is_err());
         meta_client.start(urls).await.unwrap();
 
-        let mut meta_client = MetaClientBuilder::new(0, 0, Role::Datanode)
-            .enable_router()
-            .build();
+        let mut meta_client = MetaClientBuilder::new(0, 0, Role::Datanode).build();
         assert!(meta_client.heartbeat_client().is_err());
         assert!(meta_client.store_client().is_err());
         meta_client.start(urls).await.unwrap();
@@ -599,7 +609,6 @@ mod tests {
 
         let mut meta_client = MetaClientBuilder::new(1, 2, Role::Datanode)
             .enable_heartbeat()
-            .enable_router()
             .enable_store()
             .build();
         assert_eq!(1, meta_client.id().0);
@@ -613,7 +622,6 @@ mod tests {
     async fn test_not_start_heartbeat_client() {
         let urls = &["127.0.0.1:3001", "127.0.0.1:3002"];
         let mut meta_client = MetaClientBuilder::new(0, 0, Role::Datanode)
-            .enable_router()
             .enable_store()
             .build();
         meta_client.start(urls).await.unwrap();
@@ -626,18 +634,11 @@ mod tests {
         let urls = &["127.0.0.1:3001", "127.0.0.1:3002"];
         let mut meta_client = MetaClientBuilder::new(0, 0, Role::Datanode)
             .enable_heartbeat()
-            .enable_router()
             .build();
 
         meta_client.start(urls).await.unwrap();
         let res = meta_client.put(PutRequest::default()).await;
         assert!(matches!(res.err(), Some(error::Error::NotStarted { .. })));
-    }
-
-    #[should_panic]
-    #[test]
-    fn test_failed_when_start_nothing() {
-        let _ = MetaClientBuilder::new(0, 0, Role::Datanode).build();
     }
 
     #[tokio::test]

@@ -19,10 +19,7 @@ use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use datafusion::error::DataFusionError;
-use datatypes::prelude::ConcreteDataType;
 use snafu::{Location, Snafu};
-use table::metadata::TableId;
-use tokio::task::JoinError;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -30,12 +27,14 @@ use tokio::task::JoinError;
 pub enum Error {
     #[snafu(display("Failed to list catalogs"))]
     ListCatalogs {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Failed to list {}'s schemas", catalog))]
     ListSchemas {
+        #[snafu(implicit)]
         location: Location,
         catalog: String,
         source: BoxedError,
@@ -43,6 +42,7 @@ pub enum Error {
 
     #[snafu(display("Failed to list {}.{}'s tables", catalog, schema))]
     ListTables {
+        #[snafu(implicit)]
         location: Location,
         catalog: String,
         schema: String,
@@ -51,78 +51,37 @@ pub enum Error {
 
     #[snafu(display("Failed to list nodes in cluster: {source}"))]
     ListNodes {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Failed to re-compile script due to internal error"))]
     CompileScriptInternal {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
-    },
-    #[snafu(display("Failed to open system catalog table"))]
-    OpenSystemCatalog {
-        location: Location,
-        source: table::error::Error,
-    },
-
-    #[snafu(display("Failed to create system catalog table"))]
-    CreateSystemCatalog {
-        location: Location,
-        source: table::error::Error,
     },
 
     #[snafu(display("Failed to create table, table info: {}", table_info))]
     CreateTable {
         table_info: String,
+        #[snafu(implicit)]
         location: Location,
         source: table::error::Error,
     },
 
     #[snafu(display("System catalog is not valid: {}", msg))]
-    SystemCatalog { msg: String, location: Location },
-
-    #[snafu(display(
-        "System catalog table type mismatch, expected: binary, found: {:?}",
-        data_type,
-    ))]
-    SystemCatalogTypeMismatch {
-        data_type: ConcreteDataType,
+    SystemCatalog {
+        msg: String,
+        #[snafu(implicit)]
         location: Location,
-    },
-
-    #[snafu(display("Invalid system catalog entry type: {:?}", entry_type))]
-    InvalidEntryType {
-        entry_type: Option<u8>,
-        location: Location,
-    },
-
-    #[snafu(display("Invalid system catalog key: {:?}", key))]
-    InvalidKey {
-        key: Option<String>,
-        location: Location,
-    },
-
-    #[snafu(display("Catalog value is not present"))]
-    EmptyValue { location: Location },
-
-    #[snafu(display("Failed to deserialize value"))]
-    ValueDeserialize {
-        #[snafu(source)]
-        error: serde_json::error::Error,
-        location: Location,
-    },
-
-    #[snafu(display("Table engine not found: {}", engine_name))]
-    TableEngineNotFound {
-        engine_name: String,
-        location: Location,
-        source: table::error::Error,
     },
 
     #[snafu(display("Cannot find catalog by name: {}", catalog_name))]
     CatalogNotFound {
         catalog_name: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -130,43 +89,28 @@ pub enum Error {
     SchemaNotFound {
         catalog: String,
         schema: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Table `{}` already exists", table))]
-    TableExists { table: String, location: Location },
+    TableExists {
+        table: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Table not found: {}", table))]
-    TableNotExist { table: String, location: Location },
-
-    #[snafu(display("Schema {} already exists", schema))]
-    SchemaExists { schema: String, location: Location },
-
-    #[snafu(display("Operation {} not implemented yet", operation))]
-    Unimplemented {
-        operation: String,
+    TableNotExist {
+        table: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Operation {} not supported", op))]
-    NotSupported { op: String, location: Location },
-
-    #[snafu(display("Failed to open table {table_id}"))]
-    OpenTable {
-        table_id: TableId,
-        location: Location,
-        source: table::error::Error,
-    },
-
-    #[snafu(display("Failed to open table in parallel"))]
-    ParallelOpenTable {
-        #[snafu(source)]
-        error: JoinError,
-    },
-
-    #[snafu(display("Table not found while opening table, table info: {}", table_info))]
-    TableNotFound {
-        table_info: String,
+    #[snafu(display("View info not found: {}", name))]
+    ViewInfoNotFound {
+        name: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -176,59 +120,44 @@ pub enum Error {
     #[snafu(display("Failed to find region routes"))]
     FindRegionRoutes { source: partition::error::Error },
 
-    #[snafu(display("Failed to read system catalog table records"))]
-    ReadSystemCatalog {
-        location: Location,
-        source: common_recordbatch::error::Error,
-    },
-
     #[snafu(display("Failed to create recordbatch"))]
     CreateRecordBatch {
+        #[snafu(implicit)]
         location: Location,
         source: common_recordbatch::error::Error,
-    },
-
-    #[snafu(display("Failed to insert table creation record to system catalog"))]
-    InsertCatalogRecord {
-        location: Location,
-        source: table::error::Error,
-    },
-
-    #[snafu(display("Failed to scan system catalog table"))]
-    SystemCatalogTableScan {
-        location: Location,
-        source: table::error::Error,
     },
 
     #[snafu(display("Internal error"))]
     Internal {
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Failed to upgrade weak catalog manager reference"))]
-    UpgradeWeakCatalogManagerRef { location: Location },
+    UpgradeWeakCatalogManagerRef {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
-    #[snafu(display("Failed to execute system catalog table scan"))]
-    SystemCatalogTableScanExec {
+    #[snafu(display("Failed to decode logical plan for view: {}", name))]
+    DecodePlan {
+        name: String,
+        #[snafu(implicit)]
         location: Location,
         source: common_query::error::Error,
     },
 
-    #[snafu(display("Cannot parse catalog value"))]
-    InvalidCatalogValue {
-        location: Location,
-        source: common_catalog::error::Error,
-    },
-
     #[snafu(display("Failed to perform metasrv operation"))]
     Metasrv {
+        #[snafu(implicit)]
         location: Location,
         source: meta_client::error::Error,
     },
 
     #[snafu(display("Invalid table info in catalog"))]
     InvalidTableInfoInCatalog {
+        #[snafu(implicit)]
         location: Location,
         source: datatypes::error::Error,
     },
@@ -240,29 +169,43 @@ pub enum Error {
     Datafusion {
         #[snafu(source)]
         error: DataFusionError,
+        #[snafu(implicit)]
         location: Location,
     },
-
-    #[snafu(display("Table schema mismatch"))]
-    TableSchemaMismatch {
-        location: Location,
-        source: table::error::Error,
-    },
-
-    #[snafu(display("A generic error has occurred, msg: {}", msg))]
-    Generic { msg: String, location: Location },
 
     #[snafu(display("Table metadata manager error"))]
     TableMetadataManager {
         source: common_meta::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Get null from table cache, key: {}", key))]
-    TableCacheNotGet { key: String, location: Location },
+    #[snafu(display("Failed to get table cache"))]
+    GetTableCache {
+        source: common_meta::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
-    #[snafu(display("Failed to get table cache, err: {}", err_msg))]
-    GetTableCache { err_msg: String },
+    #[snafu(display("Failed to get view info from cache"))]
+    GetViewCache {
+        source: common_meta::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Cache not found: {name}"))]
+    CacheNotFound {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to cast the catalog manager"))]
+    CastManager {
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -270,61 +213,43 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::InvalidKey { .. }
-            | Error::SchemaNotFound { .. }
+            Error::SchemaNotFound { .. }
             | Error::CatalogNotFound { .. }
             | Error::FindPartitions { .. }
             | Error::FindRegionRoutes { .. }
-            | Error::InvalidEntryType { .. }
-            | Error::ParallelOpenTable { .. } => StatusCode::Unexpected,
+            | Error::CacheNotFound { .. }
+            | Error::CastManager { .. } => StatusCode::Unexpected,
 
-            Error::TableNotFound { .. } => StatusCode::TableNotFound,
+            Error::ViewInfoNotFound { .. } => StatusCode::TableNotFound,
 
-            Error::SystemCatalog { .. }
-            | Error::EmptyValue { .. }
-            | Error::ValueDeserialize { .. } => StatusCode::StorageUnavailable,
+            Error::SystemCatalog { .. } => StatusCode::StorageUnavailable,
 
-            Error::Generic { .. }
-            | Error::SystemCatalogTypeMismatch { .. }
-            | Error::UpgradeWeakCatalogManagerRef { .. } => StatusCode::Internal,
+            Error::UpgradeWeakCatalogManagerRef { .. } => StatusCode::Internal,
 
-            Error::ReadSystemCatalog { source, .. } | Error::CreateRecordBatch { source, .. } => {
-                source.status_code()
-            }
-            Error::InvalidCatalogValue { source, .. } => source.status_code(),
-
+            Error::CreateRecordBatch { source, .. } => source.status_code(),
             Error::TableExists { .. } => StatusCode::TableAlreadyExists,
             Error::TableNotExist { .. } => StatusCode::TableNotFound,
-            Error::SchemaExists { .. } | Error::TableEngineNotFound { .. } => {
-                StatusCode::InvalidArguments
-            }
-
             Error::ListCatalogs { source, .. }
             | Error::ListNodes { source, .. }
             | Error::ListSchemas { source, .. }
             | Error::ListTables { source, .. } => source.status_code(),
 
-            Error::OpenSystemCatalog { source, .. }
-            | Error::CreateSystemCatalog { source, .. }
-            | Error::InsertCatalogRecord { source, .. }
-            | Error::OpenTable { source, .. }
-            | Error::CreateTable { source, .. }
-            | Error::TableSchemaMismatch { source, .. } => source.status_code(),
+            Error::CreateTable { source, .. } => source.status_code(),
 
             Error::Metasrv { source, .. } => source.status_code(),
-            Error::SystemCatalogTableScan { source, .. } => source.status_code(),
-            Error::SystemCatalogTableScanExec { source, .. } => source.status_code(),
+            Error::DecodePlan { source, .. } => source.status_code(),
             Error::InvalidTableInfoInCatalog { source, .. } => source.status_code(),
 
             Error::CompileScriptInternal { source, .. } | Error::Internal { source, .. } => {
                 source.status_code()
             }
 
-            Error::Unimplemented { .. } | Error::NotSupported { .. } => StatusCode::Unsupported,
             Error::QueryAccessDenied { .. } => StatusCode::AccessDenied,
             Error::Datafusion { .. } => StatusCode::EngineExecuteQuery,
             Error::TableMetadataManager { source, .. } => source.status_code(),
-            Error::TableCacheNotGet { .. } | Error::GetTableCache { .. } => StatusCode::Internal,
+            Error::GetViewCache { source, .. } | Error::GetTableCache { source, .. } => {
+                source.status_code()
+            }
         }
     }
 
@@ -357,30 +282,12 @@ mod tests {
         );
 
         assert_eq!(
-            StatusCode::Unexpected,
-            InvalidKeySnafu { key: None }.build().status_code()
-        );
-
-        assert_eq!(
             StatusCode::StorageUnavailable,
             Error::SystemCatalog {
                 msg: String::default(),
                 location: Location::generate(),
             }
             .status_code()
-        );
-
-        assert_eq!(
-            StatusCode::Internal,
-            Error::SystemCatalogTypeMismatch {
-                data_type: ConcreteDataType::binary_datatype(),
-                location: Location::generate(),
-            }
-            .status_code()
-        );
-        assert_eq!(
-            StatusCode::StorageUnavailable,
-            EmptyValueSnafu {}.build().status_code()
         );
     }
 

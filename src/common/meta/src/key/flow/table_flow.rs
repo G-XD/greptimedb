@@ -80,7 +80,7 @@ impl TableFlowKey {
 
     /// The prefix used to retrieve all [TableFlowKey]s with the specified `table_id`.
     pub fn range_start_key(table_id: TableId) -> Vec<u8> {
-        let inner = BytesAdapter::from(TableFlowKeyInner::range_start_key(table_id).into_bytes());
+        let inner = BytesAdapter::from(TableFlowKeyInner::prefix(table_id).into_bytes());
 
         FlowScoped::new(inner).to_bytes()
     }
@@ -123,12 +123,7 @@ impl TableFlowKeyInner {
     }
 
     fn prefix(table_id: TableId) -> String {
-        format!("{}/{table_id}", TABLE_FLOW_KEY_PREFIX)
-    }
-
-    /// The prefix used to retrieve all [TableFlowKey]s with the specified `table_id`.
-    fn range_start_key(table_id: TableId) -> String {
-        format!("{}/", Self::prefix(table_id))
+        format!("{}/{table_id}/", TABLE_FLOW_KEY_PREFIX)
     }
 }
 
@@ -176,6 +171,8 @@ pub fn table_flow_decoder(kv: KeyValue) -> Result<TableFlowKey> {
     TableFlowKey::from_bytes(&kv.key)
 }
 
+pub type TableFlowManagerRef = Arc<TableFlowManager>;
+
 /// The manager of [TableFlowKey].
 pub struct TableFlowManager {
     kv_backend: KvBackendRef,
@@ -188,7 +185,9 @@ impl TableFlowManager {
     }
 
     /// Retrieves all [TableFlowKey]s of the specified `table_id`.
-    pub fn nodes(&self, table_id: TableId) -> BoxStream<'static, Result<TableFlowKey>> {
+    ///
+    /// TODO(discord9): add cache for it since range request does not support cache.
+    pub fn flows(&self, table_id: TableId) -> BoxStream<'static, Result<TableFlowKey>> {
         let start_key = TableFlowKey::range_start_key(table_id);
         let req = RangeRequest::new().with_prefix(start_key);
         let stream = PaginationStream::new(

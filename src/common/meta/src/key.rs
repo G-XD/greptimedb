@@ -48,6 +48,9 @@
 //! 9. Table flow key: `__flow/source_table/{table_id}/{flownode_id}/{flow_id}/{partition_id}`
 //!     - Mapping source table's {table_id} to {flownode_id}
 //!     - Used in `Flownode` booting.
+//! 10. View info key: `__view_info/{view_id}`
+//!     - The value is a [ViewInfoValue] struct; it contains the encoded logical plan.
+//!     - This key is mainly used in constructing the view in Datanode and Frontend.
 //!
 //! All keys have related managers. The managers take care of the serialization and deserialization
 //! of keys and values, and the interaction with the underlying KV store backend.
@@ -80,22 +83,16 @@
 
 pub mod catalog_name;
 pub mod datanode_table;
-/// TODO(weny):removes id.
-#[allow(unused)]
 pub mod flow;
 pub mod schema_name;
 pub mod table_info;
 pub mod table_name;
-// TODO(weny): removes it.
-#[allow(deprecated)]
-pub mod table_region;
-// TODO(weny): removes it.
-#[allow(deprecated)]
 pub mod table_route;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 mod tombstone;
 pub(crate) mod txn_helper;
+pub mod view_info;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
@@ -115,8 +112,10 @@ use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::RegionNumber;
 use table::metadata::{RawTableInfo, TableId};
+use table::table_name::TableName;
 use table_info::{TableInfoKey, TableInfoManager, TableInfoValue};
 use table_name::{TableNameKey, TableNameManager, TableNameValue};
+use view_info::{ViewInfoKey, ViewInfoManager, ViewInfoValue};
 
 use self::catalog_name::{CatalogManager, CatalogNameKey, CatalogNameValue};
 use self::datanode_table::RegionInfo;
@@ -133,15 +132,14 @@ use crate::kv_backend::txn::{Txn, TxnOp};
 use crate::kv_backend::KvBackendRef;
 use crate::rpc::router::{region_distribution, RegionRoute, RegionStatus};
 use crate::rpc::store::BatchDeleteRequest;
-use crate::table_name::TableName;
 use crate::DatanodeId;
 
 pub const NAME_PATTERN: &str = r"[a-zA-Z_:-][a-zA-Z0-9_:\-\.]*";
-pub const MAINTENANCE_KEY: &str = "maintenance";
+pub const MAINTENANCE_KEY: &str = "__maintenance";
 
 const DATANODE_TABLE_KEY_PREFIX: &str = "__dn_table";
-const TABLE_REGION_KEY_PREFIX: &str = "__table_region";
 pub const TABLE_INFO_KEY_PREFIX: &str = "__table_info";
+pub const VIEW_INFO_KEY_PREFIX: &str = "__view_info";
 pub const TABLE_NAME_KEY_PREFIX: &str = "__table_name";
 pub const CATALOG_NAME_KEY_PREFIX: &str = "__catalog_name";
 pub const SCHEMA_NAME_KEY_PREFIX: &str = "__schema_name";
@@ -167,6 +165,11 @@ lazy_static! {
 }
 
 lazy_static! {
+    static ref VIEW_INFO_KEY_PATTERN: Regex =
+        Regex::new(&format!("^{VIEW_INFO_KEY_PREFIX}/([0-9]+)$")).unwrap();
+}
+
+lazy_static! {
     static ref TABLE_ROUTE_KEY_PATTERN: Regex =
         Regex::new(&format!("^{TABLE_ROUTE_PREFIX}/([0-9]+)$")).unwrap();
 }
@@ -188,7 +191,7 @@ lazy_static! {
     static ref CATALOG_NAME_KEY_PATTERN: Regex = Regex::new(&format!(
         "^{CATALOG_NAME_KEY_PREFIX}/({NAME_PATTERN})$"
     ))
-    .unwrap();
+        .unwrap();
 }
 
 lazy_static! {
@@ -196,7 +199,7 @@ lazy_static! {
     static ref SCHEMA_NAME_KEY_PATTERN:Regex=Regex::new(&format!(
         "^{SCHEMA_NAME_KEY_PREFIX}/({NAME_PATTERN})/({NAME_PATTERN})$"
     ))
-    .unwrap();
+        .unwrap();
 }
 
 /// The key of metadata.
@@ -247,6 +250,7 @@ pub type TableMetadataManagerRef = Arc<TableMetadataManager>;
 pub struct TableMetadataManager {
     table_name_manager: TableNameManager,
     table_info_manager: TableInfoManager,
+    view_info_manager: ViewInfoManager,
     datanode_table_manager: DatanodeTableManager,
     catalog_manager: CatalogManager,
     schema_manager: SchemaManager,
@@ -390,6 +394,7 @@ impl TableMetadataManager {
         TableMetadataManager {
             table_name_manager: TableNameManager::new(kv_backend.clone()),
             table_info_manager: TableInfoManager::new(kv_backend.clone()),
+            view_info_manager: ViewInfoManager::new(kv_backend.clone()),
             datanode_table_manager: DatanodeTableManager::new(kv_backend.clone()),
             catalog_manager: CatalogManager::new(kv_backend.clone()),
             schema_manager: SchemaManager::new(kv_backend.clone()),
@@ -425,6 +430,10 @@ impl TableMetadataManager {
 
     pub fn table_info_manager(&self) -> &TableInfoManager {
         &self.table_info_manager
+    }
+
+    pub fn view_info_manager(&self) -> &ViewInfoManager {
+        &self.view_info_manager
     }
 
     pub fn datanode_table_manager(&self) -> &DatanodeTableManager {
@@ -466,6 +475,70 @@ impl TableMetadataManager {
         let table_info_value = TxnOpGetResponseSet::decode_with(table_info_filter)(&mut set)?;
         let table_route_value = TxnOpGetResponseSet::decode_with(table_route_filter)(&mut set)?;
         Ok((table_info_value, table_route_value))
+    }
+
+    /// Creates metadata for view and returns an error if different metadata exists.
+    /// The caller MUST ensure it has the exclusive access to `TableNameKey`.
+    pub async fn create_view_metadata(
+        &self,
+        view_info: RawTableInfo,
+        raw_logical_plan: Vec<u8>,
+        table_names: HashSet<TableName>,
+    ) -> Result<()> {
+        let view_id = view_info.ident.table_id;
+
+        // Creates view name.
+        let view_name = TableNameKey::new(
+            &view_info.catalog_name,
+            &view_info.schema_name,
+            &view_info.name,
+        );
+        let create_table_name_txn = self
+            .table_name_manager()
+            .build_create_txn(&view_name, view_id)?;
+
+        // Creates table info.
+        let table_info_value = TableInfoValue::new(view_info);
+
+        let (create_table_info_txn, on_create_table_info_failure) = self
+            .table_info_manager()
+            .build_create_txn(view_id, &table_info_value)?;
+
+        // Creates view info
+        let view_info_value = ViewInfoValue::new(raw_logical_plan, table_names);
+        let (create_view_info_txn, on_create_view_info_failure) = self
+            .view_info_manager()
+            .build_create_txn(view_id, &view_info_value)?;
+
+        let txn = Txn::merge_all(vec![
+            create_table_name_txn,
+            create_table_info_txn,
+            create_view_info_txn,
+        ]);
+
+        let mut r = self.kv_backend.txn(txn).await?;
+
+        // Checks whether metadata was already created.
+        if !r.succeeded {
+            let mut set = TxnOpGetResponseSet::from(&mut r.responses);
+            let remote_table_info = on_create_table_info_failure(&mut set)?
+                .context(error::UnexpectedSnafu {
+                    err_msg: "Reads the empty table info during the create table metadata",
+                })?
+                .into_inner();
+
+            let remote_view_info = on_create_view_info_failure(&mut set)?
+                .context(error::UnexpectedSnafu {
+                    err_msg: "Reads the empty view info during the create view info",
+                })?
+                .into_inner();
+
+            let op_name = "the creating view metadata";
+            ensure_values!(remote_table_info, table_info_value, op_name);
+            ensure_values!(remote_view_info, view_info_value, op_name);
+        }
+
+        Ok(())
     }
 
     /// Creates metadata for table and returns an error if different metadata exists.
@@ -724,6 +797,33 @@ impl TableMetadataManager {
         Ok(())
     }
 
+    fn view_info_keys(&self, view_id: TableId, view_name: &TableName) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::with_capacity(3);
+        let view_name = TableNameKey::new(
+            &view_name.catalog_name,
+            &view_name.schema_name,
+            &view_name.table_name,
+        );
+        let table_info_key = TableInfoKey::new(view_id);
+        let view_info_key = ViewInfoKey::new(view_id);
+        keys.push(view_name.to_bytes());
+        keys.push(table_info_key.to_bytes());
+        keys.push(view_info_key.to_bytes());
+
+        Ok(keys)
+    }
+
+    /// Deletes metadata for view **permanently**.
+    /// The caller MUST ensure it has the exclusive access to `ViewNameKey`.
+    pub async fn destroy_view_info(&self, view_id: TableId, view_name: &TableName) -> Result<()> {
+        let keys = self.view_info_keys(view_id, view_name)?;
+        let _ = self
+            .kv_backend
+            .batch_delete(BatchDeleteRequest::new().with_keys(keys))
+            .await?;
+        Ok(())
+    }
+
     /// Renames the table name and returns an error if different metadata exists.
     /// The caller MUST ensure it has the exclusive access to old and new `TableNameKey`s,
     /// and the new `TableNameKey` MUST be empty.
@@ -813,6 +913,38 @@ impl TableMetadataManager {
 
             let op_name = "the updating table info";
             ensure_values!(remote_table_info, new_table_info_value, op_name);
+        }
+        Ok(())
+    }
+
+    /// Updates view info and returns an error if different metadata exists.
+    pub async fn update_view_info(
+        &self,
+        view_id: TableId,
+        current_view_info_value: &DeserializedValueWithBytes<ViewInfoValue>,
+        new_view_info: Vec<u8>,
+        table_names: HashSet<TableName>,
+    ) -> Result<()> {
+        let new_view_info_value = current_view_info_value.update(new_view_info, table_names);
+
+        // Updates view info.
+        let (update_view_info_txn, on_update_view_info_failure) = self
+            .view_info_manager()
+            .build_update_txn(view_id, current_view_info_value, &new_view_info_value)?;
+
+        let mut r = self.kv_backend.txn(update_view_info_txn).await?;
+
+        // Checks whether metadata was already updated.
+        if !r.succeeded {
+            let mut set = TxnOpGetResponseSet::from(&mut r.responses);
+            let remote_view_info = on_update_view_info_failure(&mut set)?
+                .context(error::UnexpectedSnafu {
+                    err_msg: "Reads the empty view info during the updating view info",
+                })?
+                .into_inner();
+
+            let op_name = "the updating view info";
+            ensure_values!(remote_view_info, new_view_info_value, op_name);
         }
         Ok(())
     }
@@ -1025,6 +1157,7 @@ macro_rules! impl_meta_key_get_txn_op {
 impl_meta_key_get_txn_op! {
     TableNameKey<'_>,
     TableInfoKey,
+    ViewInfoKey,
     TableRouteKey,
     DatanodeTableKey
 }
@@ -1049,6 +1182,7 @@ macro_rules! impl_optional_meta_value {
 impl_table_meta_value! {
     TableNameValue,
     TableInfoValue,
+    ViewInfoValue,
     DatanodeTableValue,
     FlowInfoValue,
     FlowNameValue
@@ -1061,7 +1195,7 @@ impl_optional_meta_value! {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -1070,6 +1204,7 @@ mod tests {
     use futures::TryStreamExt;
     use store_api::storage::RegionId;
     use table::metadata::{RawTableInfo, TableInfo};
+    use table::table_name::TableName;
 
     use super::datanode_table::DatanodeTableKey;
     use super::test_utils;
@@ -1080,11 +1215,10 @@ mod tests {
     use crate::key::table_info::TableInfoValue;
     use crate::key::table_name::TableNameKey;
     use crate::key::table_route::TableRouteValue;
-    use crate::key::{DeserializedValueWithBytes, TableMetadataManager};
+    use crate::key::{DeserializedValueWithBytes, TableMetadataManager, ViewInfoValue};
     use crate::kv_backend::memory::MemoryKvBackend;
     use crate::peer::Peer;
     use crate::rpc::router::{region_distribution, Region, RegionRoute, RegionStatus};
-    use crate::table_name::TableName;
 
     #[test]
     fn test_deserialized_value_with_bytes() {
@@ -1135,6 +1269,21 @@ mod tests {
 
     fn new_test_table_info(region_numbers: impl Iterator<Item = u32>) -> TableInfo {
         test_utils::new_test_table_info(10, region_numbers)
+    }
+
+    fn new_test_table_names() -> HashSet<TableName> {
+        let mut set = HashSet::new();
+        set.insert(TableName {
+            catalog_name: "greptime".to_string(),
+            schema_name: "public".to_string(),
+            table_name: "a_table".to_string(),
+        });
+        set.insert(TableName {
+            catalog_name: "greptime".to_string(),
+            schema_name: "public".to_string(),
+            table_name: "b_table".to_string(),
+        });
+        set
     }
 
     async fn create_physical_table_metadata(
@@ -1835,5 +1984,126 @@ mod tests {
             .unwrap();
         let kvs = mem_kv.dump();
         assert_eq!(kvs, expected_result);
+    }
+
+    #[tokio::test]
+    async fn test_create_update_view_info() {
+        let mem_kv = Arc::new(MemoryKvBackend::default());
+        let table_metadata_manager = TableMetadataManager::new(mem_kv);
+
+        let view_info: RawTableInfo = new_test_table_info(Vec::<u32>::new().into_iter()).into();
+
+        let view_id = view_info.ident.table_id;
+
+        let logical_plan: Vec<u8> = vec![1, 2, 3];
+
+        let table_names = new_test_table_names();
+
+        // Create metadata
+        table_metadata_manager
+            .create_view_metadata(view_info.clone(), logical_plan.clone(), table_names.clone())
+            .await
+            .unwrap();
+
+        {
+            // assert view info
+            let current_view_info = table_metadata_manager
+                .view_info_manager()
+                .get(view_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_inner();
+            assert_eq!(current_view_info.view_info, logical_plan);
+            assert_eq!(current_view_info.table_names, table_names);
+            // assert table info
+            let current_table_info = table_metadata_manager
+                .table_info_manager()
+                .get(view_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_inner();
+            assert_eq!(current_table_info.table_info, view_info);
+        }
+
+        let new_logical_plan: Vec<u8> = vec![4, 5, 6];
+        let new_table_names = {
+            let mut set = HashSet::new();
+            set.insert(TableName {
+                catalog_name: "greptime".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "b_table".to_string(),
+            });
+            set.insert(TableName {
+                catalog_name: "greptime".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "c_table".to_string(),
+            });
+            set
+        };
+
+        let current_view_info_value = DeserializedValueWithBytes::from_inner(ViewInfoValue::new(
+            logical_plan.clone(),
+            table_names,
+        ));
+        // should be ok.
+        table_metadata_manager
+            .update_view_info(
+                view_id,
+                &current_view_info_value,
+                new_logical_plan.clone(),
+                new_table_names.clone(),
+            )
+            .await
+            .unwrap();
+        // if table info was updated, it should be ok.
+        table_metadata_manager
+            .update_view_info(
+                view_id,
+                &current_view_info_value,
+                new_logical_plan.clone(),
+                new_table_names.clone(),
+            )
+            .await
+            .unwrap();
+
+        // updated view_info should equal the `new_logical_plan`
+        let updated_view_info = table_metadata_manager
+            .view_info_manager()
+            .get(view_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert_eq!(updated_view_info.view_info, new_logical_plan);
+        assert_eq!(updated_view_info.table_names, new_table_names);
+
+        let wrong_view_info = logical_plan.clone();
+        let wrong_view_info_value = DeserializedValueWithBytes::from_inner(
+            current_view_info_value.update(wrong_view_info, new_table_names.clone()),
+        );
+        // if the current_view_info_value is wrong, it should return an error.
+        // The ABA problem.
+        assert!(table_metadata_manager
+            .update_view_info(
+                view_id,
+                &wrong_view_info_value,
+                new_logical_plan.clone(),
+                new_table_names.clone(),
+            )
+            .await
+            .is_err());
+
+        // The view_info is not changed.
+        let current_view_info = table_metadata_manager
+            .view_info_manager()
+            .get(view_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert_eq!(current_view_info.view_info, new_logical_plan);
+        assert_eq!(current_view_info.table_names, new_table_names);
     }
 }

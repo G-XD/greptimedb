@@ -40,20 +40,22 @@ lazy_static.workspace = true
 meta-client.workspace = true
 meter-core.workspace = true
 meter-macros.workspace = true
+moka.workspace = true
 object-store.workspace = true
 partition.workspace = true
 prometheus.workspace = true
 query.workspace = true
 regex.workspace = true
 serde_json.workspace = true
-servers.workspace = true
 session.workspace = true
 snafu.workspace = true
 sql.workspace = true
 sqlparser.workspace = true
 store-api.workspace = true
+substrait.workspace = true
 table.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]

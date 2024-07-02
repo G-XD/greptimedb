@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
@@ -26,7 +27,7 @@ use crate::error::{
 };
 use crate::key::txn_helper::TxnOpGetResponseSet;
 use crate::key::{
-    txn_helper, DeserializedValueWithBytes, MetaKey, RegionDistribution, TableMetaValue,
+    DeserializedValueWithBytes, MetaKey, RegionDistribution, TableMetaValue,
     TABLE_ROUTE_KEY_PATTERN, TABLE_ROUTE_PREFIX,
 };
 use crate::kv_backend::txn::Txn;
@@ -55,7 +56,7 @@ pub enum TableRouteValue {
     Logical(LogicalTableRouteValue),
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Default)]
 pub struct PhysicalTableRouteValue {
     pub region_routes: Vec<RegionRoute>,
     version: u64,
@@ -276,6 +277,8 @@ impl Display for TableRouteKey {
     }
 }
 
+pub type TableRouteManagerRef = Arc<TableRouteManager>;
+
 pub struct TableRouteManager {
     storage: TableRouteStorage,
 }
@@ -489,10 +492,7 @@ impl TableRouteStorage {
         let key = TableRouteKey::new(table_id);
         let raw_key = key.to_bytes();
 
-        let txn = txn_helper::build_put_if_absent_txn(
-            raw_key.clone(),
-            table_route_value.try_as_raw_value()?,
-        );
+        let txn = Txn::put_if_not_exists(raw_key.clone(), table_route_value.try_as_raw_value()?);
 
         Ok((
             txn,
@@ -519,7 +519,7 @@ impl TableRouteStorage {
         let raw_value = current_table_route_value.get_raw_bytes();
         let new_raw_value: Vec<u8> = new_table_route_value.try_as_raw_value()?;
 
-        let txn = txn_helper::build_compare_and_put_txn(raw_key.clone(), raw_value, new_raw_value);
+        let txn = Txn::compare_and_put(raw_key.clone(), raw_value, new_raw_value);
 
         Ok((
             txn,

@@ -69,8 +69,7 @@ impl FlownodeFlowKey {
 
     /// The prefix used to retrieve all [FlownodeFlowKey]s with the specified `flownode_id`.
     pub fn range_start_key(flownode_id: FlownodeId) -> Vec<u8> {
-        let inner =
-            BytesAdapter::from(FlownodeFlowKeyInner::range_start_key(flownode_id).into_bytes());
+        let inner = BytesAdapter::from(FlownodeFlowKeyInner::prefix(flownode_id).into_bytes());
 
         FlowScoped::new(inner).to_bytes()
     }
@@ -80,6 +79,7 @@ impl FlownodeFlowKey {
         self.0.flow_id
     }
 
+    #[cfg(test)]
     /// Returns the [FlownodeId].
     pub fn flownode_id(&self) -> FlownodeId {
         self.0.flownode_id
@@ -108,13 +108,8 @@ impl FlownodeFlowKeyInner {
         }
     }
 
-    fn prefix(flownode_id: FlownodeId) -> String {
-        format!("{}/{flownode_id}", FLOWNODE_FLOW_KEY_PREFIX)
-    }
-
-    /// The prefix used to retrieve all [FlownodeFlowKey]s with the specified `flownode_id`.
-    fn range_start_key(flownode_id: FlownodeId) -> String {
-        format!("{}/", Self::prefix(flownode_id))
+    pub fn prefix(flownode_id: FlownodeId) -> String {
+        format!("{}/{flownode_id}/", FLOWNODE_FLOW_KEY_PREFIX)
     }
 }
 

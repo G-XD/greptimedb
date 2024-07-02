@@ -18,23 +18,21 @@ use datafusion_sql::parser::Statement as DfStatement;
 use sqlparser::ast::Statement as SpStatement;
 use sqlparser_derive::{Visit, VisitMut};
 
-use super::create::CreateFlow;
-use super::drop::DropDatabase;
-use super::show::ShowVariables;
 use crate::error::{ConvertToDfStatementSnafu, Error};
 use crate::statements::alter::AlterTable;
 use crate::statements::create::{
-    CreateDatabase, CreateExternalTable, CreateTable, CreateTableLike,
+    CreateDatabase, CreateExternalTable, CreateFlow, CreateTable, CreateTableLike, CreateView,
 };
 use crate::statements::delete::Delete;
 use crate::statements::describe::DescribeTable;
-use crate::statements::drop::DropTable;
+use crate::statements::drop::{DropDatabase, DropFlow, DropTable};
 use crate::statements::explain::Explain;
 use crate::statements::insert::Insert;
 use crate::statements::query::Query;
 use crate::statements::set_variables::SetVariables;
 use crate::statements::show::{
-    ShowColumns, ShowCreateTable, ShowDatabases, ShowIndex, ShowKind, ShowTables,
+    ShowColumns, ShowCreateFlow, ShowCreateTable, ShowDatabases, ShowIndex, ShowKind, ShowStatus,
+    ShowTables, ShowVariables,
 };
 use crate::statements::tql::Tql;
 use crate::statements::truncate::TruncateTable;
@@ -57,6 +55,10 @@ pub enum Statement {
     CreateTableLike(CreateTableLike),
     // CREATE FLOW
     CreateFlow(CreateFlow),
+    // DROP FLOW
+    DropFlow(DropFlow),
+    // CREATE VIEW ... AS
+    CreateView(CreateView),
     // DROP TABLE
     DropTable(DropTable),
     // DROP DATABASE
@@ -79,6 +81,10 @@ pub enum Statement {
     ShowIndex(ShowIndex),
     // SHOW CREATE TABLE
     ShowCreateTable(ShowCreateTable),
+    // SHOW CREATE FLOW
+    ShowCreateFlow(ShowCreateFlow),
+    // SHOW STATUS
+    ShowStatus(ShowStatus),
     // DESCRIBE TABLE
     DescribeTable(DescribeTable),
     // EXPLAIN QUERY
@@ -104,6 +110,7 @@ impl Display for Statement {
             Statement::CreateExternalTable(s) => s.fmt(f),
             Statement::CreateTableLike(s) => s.fmt(f),
             Statement::CreateFlow(s) => s.fmt(f),
+            Statement::DropFlow(s) => s.fmt(f),
             Statement::DropTable(s) => s.fmt(f),
             Statement::DropDatabase(s) => s.fmt(f),
             Statement::CreateDatabase(s) => s.fmt(f),
@@ -113,6 +120,8 @@ impl Display for Statement {
             Statement::ShowColumns(s) => s.fmt(f),
             Statement::ShowIndex(s) => s.fmt(f),
             Statement::ShowCreateTable(s) => s.fmt(f),
+            Statement::ShowCreateFlow(s) => s.fmt(f),
+            Statement::ShowStatus(s) => s.fmt(f),
             Statement::DescribeTable(s) => s.fmt(f),
             Statement::Explain(s) => s.fmt(f),
             Statement::Copy(s) => s.fmt(f),
@@ -126,6 +135,7 @@ impl Display for Statement {
             Statement::ShowCollation(kind) => {
                 write!(f, "SHOW COLLATION {kind}")
             }
+            Statement::CreateView(s) => s.fmt(f),
         }
     }
 }

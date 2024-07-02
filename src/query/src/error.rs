@@ -29,47 +29,58 @@ use store_api::storage::RegionId;
 #[stack_trace_debug]
 pub enum Error {
     #[snafu(display("Unsupported expr type: {}", name))]
-    UnsupportedExpr { name: String, location: Location },
+    UnsupportedExpr {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Unsupported show variable: {}", name))]
-    UnsupportedVariable { name: String, location: Location },
+    UnsupportedVariable {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Operation {} not implemented yet", operation))]
     Unimplemented {
         operation: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("General catalog error"))]
     Catalog {
         source: catalog::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Catalog not found: {}", catalog))]
-    CatalogNotFound { catalog: String, location: Location },
-
-    #[snafu(display("Schema not found: {}", schema))]
-    SchemaNotFound { schema: String, location: Location },
-
     #[snafu(display("Table not found: {}", table))]
-    TableNotFound { table: String, location: Location },
+    TableNotFound {
+        table: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to create RecordBatch"))]
     CreateRecordBatch {
         source: common_recordbatch::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failure during query execution"))]
     QueryExecution {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failure during query planning"))]
     QueryPlan {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -77,6 +88,7 @@ pub enum Error {
     QueryParse {
         query: String,
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -84,15 +96,21 @@ pub enum Error {
     QueryAccessDenied {
         catalog: String,
         schema: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("The SQL string has multiple statements, query: {}", query))]
-    MultipleStatements { query: String, location: Location },
+    MultipleStatements {
+        query: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to convert Datafusion schema"))]
     ConvertDatafusionSchema {
         source: datatypes::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -101,17 +119,16 @@ pub enum Error {
         raw: String,
         #[snafu(source)]
         error: chrono::ParseError,
+        #[snafu(implicit)]
         location: Location,
     },
-
-    #[snafu(display("Invalid timestamp `{}`", raw))]
-    InvalidTimestamp { raw: String, location: Location },
 
     #[snafu(display("Failed to parse float number `{}`", raw))]
     ParseFloat {
         raw: String,
         #[snafu(source)]
         error: std::num::ParseFloatError,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -119,17 +136,13 @@ pub enum Error {
     DataFusion {
         #[snafu(source)]
         error: DataFusionError,
-        location: Location,
-    },
-
-    #[snafu(display("Failed to encode Substrait logical plan"))]
-    EncodeSubstraitLogicalPlan {
-        source: substrait::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("General SQL error"))]
     Sql {
+        #[snafu(implicit)]
         location: Location,
         source: sql::error::Error,
     },
@@ -138,12 +151,14 @@ pub enum Error {
     PlanSql {
         #[snafu(source)]
         error: DataFusionError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Timestamp column for table '{table_name}' is missing!"))]
     MissingTimestampColumn {
         table_name: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -151,6 +166,7 @@ pub enum Error {
     ConvertSqlValue {
         value: Value,
         source: sql::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -158,14 +174,20 @@ pub enum Error {
     ConvertSqlType {
         datatype: ConcreteDataType,
         source: sql::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Missing required field: {}", name))]
-    MissingRequiredField { name: String, location: Location },
+    MissingRequiredField {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to regex"))]
     BuildRegex {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: regex::Error,
@@ -174,41 +196,54 @@ pub enum Error {
     #[snafu(display("Failed to build data source backend"))]
     BuildBackend {
         source: common_datasource::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to list objects"))]
     ListObjects {
         source: common_datasource::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to parse file format"))]
     ParseFileFormat {
         source: common_datasource::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to infer schema"))]
     InferSchema {
         source: common_datasource::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Failed to convert datafusion schema"))]
     ConvertSchema {
         source: datatypes::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Unknown table type, downcast failed"))]
-    UnknownTable { location: Location },
+    UnknownTable {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Cannot find time index column in table {}", table))]
-    TimeIndexNotFound { table: String, location: Location },
+    TimeIndexNotFound {
+        table: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to add duration '{:?}' to SystemTime, overflowed", duration))]
     AddSystemTimeOverflow {
         duration: Duration,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -222,29 +257,43 @@ pub enum Error {
         column: String,
         file_type: ConcreteDataType,
         table_type: ConcreteDataType,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Column schema has no default value, column: {}", column))]
-    ColumnSchemaNoDefault { column: String, location: Location },
+    ColumnSchemaNoDefault {
+        column: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Region query error"))]
     RegionQuery {
         source: BoxedError,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Table mutation error"))]
     TableMutation {
         source: common_query::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Missing table mutation handler"))]
-    MissingTableMutationHandler { location: Location },
+    MissingTableMutationHandler {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Range Query: {}", msg))]
-    RangeQuery { msg: String, location: Location },
+    RangeQuery {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display(
         "Failed to get metadata from engine {} for region_id {}",
@@ -254,6 +303,7 @@ pub enum Error {
     GetRegionMetadata {
         engine: String,
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
         source: BoxedError,
     },
@@ -269,13 +319,10 @@ impl ErrorExt for Error {
             }
             UnsupportedExpr { .. }
             | Unimplemented { .. }
-            | CatalogNotFound { .. }
-            | SchemaNotFound { .. }
             | TableNotFound { .. }
             | UnknownTable { .. }
             | TimeIndexNotFound { .. }
             | ParseTimestamp { .. }
-            | InvalidTimestamp { .. }
             | ParseFloat { .. }
             | MissingRequiredField { .. }
             | BuildRegex { .. }
@@ -286,7 +333,6 @@ impl ErrorExt for Error {
             | ColumnSchemaNoDefault { .. } => StatusCode::InvalidArguments,
 
             BuildBackend { .. } | ListObjects { .. } => StatusCode::StorageUnavailable,
-            EncodeSubstraitLogicalPlan { source, .. } => source.status_code(),
 
             ParseFileFormat { source, .. } | InferSchema { source, .. } => source.status_code(),
 

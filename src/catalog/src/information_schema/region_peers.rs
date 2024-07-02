@@ -19,9 +19,9 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use common_catalog::consts::INFORMATION_SCHEMA_REGION_PEERS_TABLE_ID;
 use common_error::ext::BoxedError;
 use common_meta::rpc::router::RegionRoute;
-use common_query::physical_plan::TaskContext;
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DfRecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream as DfPartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream as DfSendableRecordBatchStream;
@@ -31,7 +31,7 @@ use datatypes::value::Value;
 use datatypes::vectors::{Int64VectorBuilder, StringVectorBuilder, UInt64VectorBuilder};
 use futures::{StreamExt, TryStreamExt};
 use snafu::{OptionExt, ResultExt};
-use store_api::storage::{ScanRequest, TableId};
+use store_api::storage::{RegionId, ScanRequest, TableId};
 use table::metadata::TableType;
 
 use super::REGION_PEERS;
@@ -179,7 +179,6 @@ impl InformationSchemaRegionPeersBuilder {
         for schema_name in catalog_manager.schema_names(&catalog_name).await? {
             let table_id_stream = catalog_manager
                 .tables(&catalog_name, &schema_name)
-                .await
                 .try_filter_map(|t| async move {
                     let table_info = t.table_info();
                     if table_info.table_type == TableType::Temporary {
@@ -206,8 +205,8 @@ impl InformationSchemaRegionPeersBuilder {
                     table_ids.into_iter().map(|id| (id, vec![])).collect()
                 };
 
-                for routes in table_routes.values() {
-                    self.add_region_peers(&predicates, routes);
+                for (table_id, routes) in table_routes {
+                    self.add_region_peers(&predicates, table_id, &routes);
                 }
             }
         }
@@ -215,9 +214,14 @@ impl InformationSchemaRegionPeersBuilder {
         self.finish()
     }
 
-    fn add_region_peers(&mut self, predicates: &Predicates, routes: &[RegionRoute]) {
+    fn add_region_peers(
+        &mut self,
+        predicates: &Predicates,
+        table_id: TableId,
+        routes: &[RegionRoute],
+    ) {
         for route in routes {
-            let region_id = route.region.id.as_u64();
+            let region_id = RegionId::new(table_id, route.region.id.region_number()).as_u64();
             let peer_id = route.leader_peer.clone().map(|p| p.id);
             let peer_addr = route.leader_peer.clone().map(|p| p.addr);
             let status = if let Some(status) = route.leader_status {

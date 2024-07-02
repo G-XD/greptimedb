@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use api::region::RegionResponse;
-use api::v1::flow::{FlowRequest, FlowResponse, InsertRequest};
-use api::v1::region::{QueryRequest, RegionRequest};
+use api::v1::flow::{FlowRequest, FlowResponse};
+use api::v1::region::{InsertRequests, RegionRequest};
 pub use common_base::AffectedRows;
+use common_query::request::QueryRequest;
 use common_recordbatch::SendableRecordBatchStream;
 
 use crate::error::Result;
@@ -40,7 +41,7 @@ pub type DatanodeRef = Arc<dyn Datanode>;
 pub trait Flownode: Send + Sync {
     async fn handle(&self, request: FlowRequest) -> Result<FlowResponse>;
 
-    async fn handle_insert(&self, request: InsertRequest) -> Result<FlowResponse>;
+    async fn handle_inserts(&self, request: InsertRequests) -> Result<FlowResponse>;
 }
 
 pub type FlownodeRef = Arc<dyn Flownode>;

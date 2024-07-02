@@ -163,6 +163,17 @@ nextest: ## Install nextest tools.
 sqlness-test: ## Run sqlness test.
 	cargo sqlness
 
+# Run fuzz test ${FUZZ_TARGET}.
+RUNS ?= 1
+FUZZ_TARGET ?= fuzz_alter_table
+.PHONY: fuzz
+fuzz:
+	cargo fuzz run ${FUZZ_TARGET} --fuzz-dir tests-fuzz -D -s none -- -runs=${RUNS}
+
+.PHONY: fuzz-ls
+fuzz-ls:
+	cargo fuzz list --fuzz-dir tests-fuzz 
+
 .PHONY: check
 check: ## Cargo check all the targets.
 	cargo check --workspace --all-targets --all-features
@@ -194,12 +205,16 @@ run-it-in-container: start-etcd ## Run integration tests in dev-builder.
 	-w /greptimedb ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/dev-builder-${BASE_IMAGE}:latest \
 	make test sqlness-test BUILD_JOBS=${BUILD_JOBS}
 
+.PHONY: run-cluster-with-etcd
+run-cluster-with-etcd: ## Run greptime cluster with etcd in docker-compose.
+	 docker compose -f ./docker/docker-compose/cluster-with-etcd.yaml up
+
 ##@ Docs
 config-docs: ## Generate configuration documentation from toml files.
 	docker run --rm \
     -v ${PWD}:/greptimedb \
     -w /greptimedb/config \
-    toml2docs/toml2docs:latest \
+    toml2docs/toml2docs:v0.1.1 \
     -p '##' \
     -t ./config-docs-template.md \
     -o ./config.md

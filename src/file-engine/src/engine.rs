@@ -25,7 +25,9 @@ use common_telemetry::{error, info};
 use object_store::ObjectStore;
 use snafu::{ensure, OptionExt};
 use store_api::metadata::RegionMetadataRef;
-use store_api::region_engine::{RegionEngine, RegionRole, SetReadonlyResponse};
+use store_api::region_engine::{
+    RegionEngine, RegionRole, RegionScannerRef, SetReadonlyResponse, SinglePartitionScanner,
+};
 use store_api::region_request::{
     AffectedRows, RegionCloseRequest, RegionCreateRequest, RegionDropRequest, RegionOpenRequest,
     RegionRequest,
@@ -48,6 +50,20 @@ impl FileRegionEngine {
         Self {
             inner: Arc::new(EngineInner::new(object_store)),
         }
+    }
+
+    async fn handle_query(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+    ) -> Result<SendableRecordBatchStream, BoxedError> {
+        self.inner
+            .get_region(region_id)
+            .await
+            .context(RegionNotFoundSnafu { region_id })
+            .map_err(BoxedError::new)?
+            .query(request)
+            .map_err(BoxedError::new)
     }
 }
 
@@ -72,14 +88,10 @@ impl RegionEngine for FileRegionEngine {
         &self,
         region_id: RegionId,
         request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream, BoxedError> {
-        self.inner
-            .get_region(region_id)
-            .await
-            .context(RegionNotFoundSnafu { region_id })
-            .map_err(BoxedError::new)?
-            .query(request)
-            .map_err(BoxedError::new)
+    ) -> Result<RegionScannerRef, BoxedError> {
+        let stream = self.handle_query(region_id, request).await?;
+        let scanner = Box::new(SinglePartitionScanner::new(stream));
+        Ok(scanner)
     }
 
     async fn get_metadata(&self, region_id: RegionId) -> Result<RegionMetadataRef, BoxedError> {
@@ -95,7 +107,7 @@ impl RegionEngine for FileRegionEngine {
         self.inner.stop().await.map_err(BoxedError::new)
     }
 
-    async fn region_disk_usage(&self, _: RegionId) -> Option<i64> {
+    fn region_disk_usage(&self, _: RegionId) -> Option<i64> {
         None
     }
 
@@ -217,8 +229,9 @@ impl EngineInner {
         let res = FileRegion::create(region_id, request, &self.object_store).await;
         let region = res.inspect_err(|err| {
             error!(
-                "Failed to create region, region_id: {}, err: {}",
-                region_id, err
+                err;
+                "Failed to create region, region_id: {}",
+                region_id
             );
         })?;
         self.regions.write().unwrap().insert(region_id, region);
@@ -247,8 +260,9 @@ impl EngineInner {
         let res = FileRegion::open(region_id, request, &self.object_store).await;
         let region = res.inspect_err(|err| {
             error!(
-                "Failed to open region, region_id: {}, err: {}",
-                region_id, err
+                err;
+                "Failed to open region, region_id: {}",
+                region_id
             );
         })?;
         self.regions.write().unwrap().insert(region_id, region);
@@ -290,8 +304,9 @@ impl EngineInner {
             let res = FileRegion::drop(&region, &self.object_store).await;
             res.inspect_err(|err| {
                 error!(
-                    "Failed to drop region, region_id: {}, err: {}",
-                    region_id, err
+                    err;
+                    "Failed to drop region, region_id: {}",
+                    region_id
                 );
             })?;
         }

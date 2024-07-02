@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::flow::flow_server::Flow;
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -21,9 +20,7 @@ use snafu::OptionExt;
 use crate::error::{self, Result};
 use crate::key::flow::FlowScoped;
 use crate::key::txn_helper::TxnOpGetResponseSet;
-use crate::key::{
-    txn_helper, DeserializedValueWithBytes, FlowId, MetaKey, TableMetaValue, NAME_PATTERN,
-};
+use crate::key::{DeserializedValueWithBytes, FlowId, MetaKey, TableMetaValue, NAME_PATTERN};
 use crate::kv_backend::txn::Txn;
 use crate::kv_backend::KvBackendRef;
 
@@ -48,11 +45,13 @@ impl<'a> FlowNameKey<'a> {
         FlowNameKey(FlowScoped::new(inner))
     }
 
+    #[cfg(test)]
     /// Returns the catalog.
     pub fn catalog(&self) -> &str {
         self.0.catalog_name
     }
 
+    #[cfg(test)]
     /// Return the `flow_name`
     pub fn flow_name(&self) -> &str {
         self.0.flow_name
@@ -187,10 +186,7 @@ impl FlowNameManager {
         let key = FlowNameKey::new(catalog_name, flow_name);
         let raw_key = key.to_bytes();
         let flow_flow_name_value = FlowNameValue::new(flow_id);
-        let txn = txn_helper::build_put_if_absent_txn(
-            raw_key.clone(),
-            flow_flow_name_value.try_as_raw_value()?,
-        );
+        let txn = Txn::put_if_not_exists(raw_key.clone(), flow_flow_name_value.try_as_raw_value()?);
 
         Ok((
             txn,

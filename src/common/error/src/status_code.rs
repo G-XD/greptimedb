@@ -15,6 +15,7 @@
 use std::fmt;
 
 use strum::{AsRefStr, EnumIter, EnumString, FromRepr};
+use tonic::Code;
 
 /// Common status code for public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, AsRefStr, EnumIter, FromRepr)]
@@ -97,6 +98,11 @@ pub enum StatusCode {
     /// User is not authorized to perform the operation
     PermissionDenied = 7006,
     // ====== End of auth related status code =====
+
+    // ====== Begin of flow related status code =====
+    FlowAlreadyExists = 8000,
+    FlowNotFound = 8001,
+    // ====== End of flow related status code =====
 }
 
 impl StatusCode {
@@ -125,8 +131,10 @@ impl StatusCode {
             | StatusCode::EngineExecuteQuery
             | StatusCode::TableAlreadyExists
             | StatusCode::TableNotFound
-            | StatusCode::RegionNotFound
             | StatusCode::RegionAlreadyExists
+            | StatusCode::RegionNotFound
+            | StatusCode::FlowAlreadyExists
+            | StatusCode::FlowNotFound
             | StatusCode::RegionReadonly
             | StatusCode::TableColumnNotFound
             | StatusCode::TableColumnExists
@@ -161,10 +169,12 @@ impl StatusCode {
             | StatusCode::InvalidSyntax
             | StatusCode::TableAlreadyExists
             | StatusCode::TableNotFound
+            | StatusCode::RegionAlreadyExists
             | StatusCode::RegionNotFound
+            | StatusCode::FlowAlreadyExists
+            | StatusCode::FlowNotFound
             | StatusCode::RegionNotReady
             | StatusCode::RegionBusy
-            | StatusCode::RegionAlreadyExists
             | StatusCode::RegionReadonly
             | StatusCode::TableColumnNotFound
             | StatusCode::TableColumnExists
@@ -190,6 +200,75 @@ impl fmt::Display for StatusCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The current debug format is suitable to display.
         write!(f, "{self:?}")
+    }
+}
+
+#[macro_export]
+macro_rules! define_into_tonic_status {
+    ($Error: ty) => {
+        impl From<$Error> for tonic::Status {
+            fn from(err: $Error) -> Self {
+                use tonic::codegen::http::{HeaderMap, HeaderValue};
+                use tonic::metadata::MetadataMap;
+                use $crate::GREPTIME_DB_HEADER_ERROR_CODE;
+
+                let mut headers = HeaderMap::<HeaderValue>::with_capacity(2);
+
+                // If either of the status_code or error msg cannot convert to valid HTTP header value
+                // (which is a very rare case), just ignore. Client will use Tonic status code and message.
+                let status_code = err.status_code();
+                headers.insert(
+                    GREPTIME_DB_HEADER_ERROR_CODE,
+                    HeaderValue::from(status_code as u32),
+                );
+                let root_error = err.output_msg();
+
+                let metadata = MetadataMap::from_headers(headers);
+                tonic::Status::with_metadata(
+                    $crate::status_code::status_to_tonic_code(status_code),
+                    root_error,
+                    metadata,
+                )
+            }
+        }
+    };
+}
+
+/// Returns the tonic [Code] of a [StatusCode].
+pub fn status_to_tonic_code(status_code: StatusCode) -> Code {
+    match status_code {
+        StatusCode::Success => Code::Ok,
+        StatusCode::Unknown => Code::Unknown,
+        StatusCode::Unsupported => Code::Unimplemented,
+        StatusCode::Unexpected
+        | StatusCode::Internal
+        | StatusCode::PlanQuery
+        | StatusCode::EngineExecuteQuery => Code::Internal,
+        StatusCode::InvalidArguments | StatusCode::InvalidSyntax | StatusCode::RequestOutdated => {
+            Code::InvalidArgument
+        }
+        StatusCode::Cancelled => Code::Cancelled,
+        StatusCode::TableAlreadyExists
+        | StatusCode::TableColumnExists
+        | StatusCode::RegionAlreadyExists
+        | StatusCode::FlowAlreadyExists => Code::AlreadyExists,
+        StatusCode::TableNotFound
+        | StatusCode::RegionNotFound
+        | StatusCode::TableColumnNotFound
+        | StatusCode::DatabaseNotFound
+        | StatusCode::UserNotFound
+        | StatusCode::FlowNotFound => Code::NotFound,
+        StatusCode::StorageUnavailable | StatusCode::RegionNotReady => Code::Unavailable,
+        StatusCode::RuntimeResourcesExhausted
+        | StatusCode::RateLimited
+        | StatusCode::RegionBusy => Code::ResourceExhausted,
+        StatusCode::UnsupportedPasswordType
+        | StatusCode::UserPasswordMismatch
+        | StatusCode::AuthHeaderNotFound
+        | StatusCode::InvalidAuthHeader => Code::Unauthenticated,
+        StatusCode::AccessDenied | StatusCode::PermissionDenied | StatusCode::RegionReadonly => {
+            Code::PermissionDenied
+        }
     }
 }
 

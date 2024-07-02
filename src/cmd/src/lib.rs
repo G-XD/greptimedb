@@ -15,12 +15,14 @@
 #![feature(assert_matches, let_chains)]
 
 use async_trait::async_trait;
-use clap::arg;
 use common_telemetry::{error, info};
+
+use crate::error::Result;
 
 pub mod cli;
 pub mod datanode;
 pub mod error;
+pub mod flownode;
 pub mod frontend;
 pub mod metasrv;
 pub mod options;
@@ -36,32 +38,39 @@ pub trait App: Send {
     fn name(&self) -> &str;
 
     /// A hook for implementor to make something happened before actual startup. Defaults to no-op.
-    async fn pre_start(&mut self) -> error::Result<()> {
+    async fn pre_start(&mut self) -> Result<()> {
         Ok(())
     }
 
-    async fn start(&mut self) -> error::Result<()>;
+    async fn start(&mut self) -> Result<()>;
 
-    async fn stop(&self) -> error::Result<()>;
-}
-
-pub async fn start_app(mut app: Box<dyn App>) -> error::Result<()> {
-    info!("Starting app: {}", app.name());
-
-    app.pre_start().await?;
-
-    app.start().await?;
-
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        error!("Failed to listen for ctrl-c signal: {}", e);
-        // It's unusual to fail to listen for ctrl-c signal, maybe there's something unexpected in
-        // the underlying system. So we stop the app instead of running nonetheless to let people
-        // investigate the issue.
+    /// Waits the quit signal by default.
+    fn wait_signal(&self) -> bool {
+        true
     }
 
-    app.stop().await?;
-    info!("Goodbye!");
-    Ok(())
+    async fn stop(&self) -> Result<()>;
+
+    async fn run(&mut self) -> Result<()> {
+        info!("Starting app: {}", self.name());
+
+        self.pre_start().await?;
+
+        self.start().await?;
+
+        if self.wait_signal() {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                error!(e; "Failed to listen for ctrl-c signal");
+                // It's unusual to fail to listen for ctrl-c signal, maybe there's something unexpected in
+                // the underlying system. So we stop the app instead of running nonetheless to let people
+                // investigate the issue.
+            }
+        }
+
+        self.stop().await?;
+        info!("Goodbye!");
+        Ok(())
+    }
 }
 
 /// Log the versions of the application, and the arguments passed to the cli.
@@ -77,15 +86,6 @@ pub fn log_versions(version_string: &str, app_version: &str) {
     info!("GreptimeDB version: {}", version_string);
 
     log_env_flags();
-}
-
-pub fn greptimedb_cli() -> clap::Command {
-    let cmd = clap::Command::new("greptimedb").subcommand_required(true);
-
-    #[cfg(feature = "tokio-console")]
-    let cmd = cmd.arg(arg!(--"tokio-console-addr"[TOKIO_CONSOLE_ADDR]));
-
-    cmd.args([arg!(--"log-dir"[LOG_DIR]), arg!(--"log-level"[LOG_LEVEL])])
 }
 
 fn log_env_flags() {

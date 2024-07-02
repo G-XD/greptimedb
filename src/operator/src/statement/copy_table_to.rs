@@ -79,7 +79,6 @@ impl StatementExecutor {
                 Box::pin(DfRecordBatchStreamAdapter::new(stream)),
                 object_store,
                 path,
-                threshold,
                 WRITE_CONCURRENCY,
             )
             .await
@@ -110,7 +109,6 @@ impl StatementExecutor {
                     req.timestamp_range.as_ref(),
                 )
             })
-            .map(|filter| filter.df_expr().clone())
             .into_iter()
             .collect::<Vec<_>>();
 

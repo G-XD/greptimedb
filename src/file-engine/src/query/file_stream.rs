@@ -19,19 +19,18 @@ use common_datasource::file_format::json::{JsonFormat, JsonOpener};
 use common_datasource::file_format::orc::{OrcFormat, OrcOpener};
 use common_datasource::file_format::parquet::{DefaultParquetFileReaderFactory, ParquetFormat};
 use common_datasource::file_format::Format;
-use common_query::prelude::Expr;
-use common_query::DfPhysicalPlan;
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::SendableRecordBatchStream;
 use datafusion::common::{Statistics, ToDFSchema};
-use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{FileOpener, FileScanConfig, FileStream, ParquetExec};
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::expr::Expr;
 use datafusion_expr::utils::conjunction;
 use datatypes::arrow::datatypes::Schema as ArrowSchema;
 use datatypes::schema::SchemaRef;
@@ -182,10 +181,7 @@ fn new_parquet_stream_with_exec_plan(
     };
 
     // build predicate filter
-    let filters = filters
-        .iter()
-        .map(|f| f.df_expr().clone())
-        .collect::<Vec<_>>();
+    let filters = filters.to_vec();
     let filters = if let Some(expr) = conjunction(filters) {
         let df_schema = file_schema
             .clone()
@@ -201,10 +197,15 @@ fn new_parquet_stream_with_exec_plan(
 
     // TODO(ruihang): get this from upper layer
     let task_ctx = SessionContext::default().task_ctx();
-    let parquet_exec = ParquetExec::new(scan_config, filters, None, TableParquetOptions::default())
+    let mut builder = ParquetExec::builder(scan_config);
+    if let Some(filters) = filters {
+        builder = builder.with_predicate(filters);
+    }
+    let parquet_exec = builder
         .with_parquet_file_reader_factory(Arc::new(DefaultParquetFileReaderFactory::new(
             store.clone(),
-        )));
+        )))
+        .build();
     let stream = parquet_exec
         .execute(0, task_ctx)
         .context(error::ParquetScanPlanSnafu)?;

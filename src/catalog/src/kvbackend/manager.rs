@@ -15,17 +15,14 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use async_stream::try_stream;
 use common_catalog::consts::{
     DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, INFORMATION_SCHEMA_NAME, NUMBERS_TABLE_ID,
 };
-use common_catalog::format_full_table_name;
 use common_config::Mode;
 use common_error::ext::BoxedError;
-use common_meta::cache_invalidator::{CacheInvalidator, Context, MultiCacheInvalidator};
-use common_meta::instruction::CacheIdent;
+use common_meta::cache::{LayeredCacheRegistryRef, ViewInfoCacheRef};
 use common_meta::key::catalog_name::CatalogNameKey;
 use common_meta::key::schema_name::SchemaNameKey;
 use common_meta::key::table_info::TableInfoValue;
@@ -35,20 +32,20 @@ use common_meta::kv_backend::KvBackendRef;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use meta_client::client::MetaClient;
-use moka::future::{Cache as AsyncCache, CacheBuilder};
 use moka::sync::Cache;
 use partition::manager::{PartitionRuleManager, PartitionRuleManagerRef};
 use snafu::prelude::*;
 use table::dist_table::DistTable;
 use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
+use table::table_name::TableName;
 use table::TableRef;
 
-use crate::error::Error::{GetTableCache, TableCacheNotGet};
 use crate::error::{
-    InvalidTableInfoInCatalogSnafu, ListCatalogsSnafu, ListSchemasSnafu, ListTablesSnafu, Result,
-    TableCacheNotGetSnafu, TableMetadataManagerSnafu,
+    CacheNotFoundSnafu, GetTableCacheSnafu, InvalidTableInfoInCatalogSnafu, ListCatalogsSnafu,
+    ListSchemasSnafu, ListTablesSnafu, Result, TableMetadataManagerSnafu,
 };
 use crate::information_schema::InformationSchemaProvider;
+use crate::kvbackend::TableCacheRef;
 use crate::CatalogManager;
 
 /// Access all existing catalog, schema and tables.
@@ -64,64 +61,27 @@ pub struct KvBackendCatalogManager {
     table_metadata_manager: TableMetadataManagerRef,
     /// A sub-CatalogManager that handles system tables
     system_catalog: SystemCatalog,
-    table_cache: AsyncCache<String, TableRef>,
-}
-
-struct TableCacheInvalidator {
-    table_cache: AsyncCache<String, TableRef>,
-}
-
-impl TableCacheInvalidator {
-    pub fn new(table_cache: AsyncCache<String, TableRef>) -> Self {
-        Self { table_cache }
-    }
-}
-
-#[async_trait::async_trait]
-impl CacheInvalidator for TableCacheInvalidator {
-    async fn invalidate(
-        &self,
-        _ctx: &Context,
-        caches: Vec<CacheIdent>,
-    ) -> common_meta::error::Result<()> {
-        for cache in caches {
-            if let CacheIdent::TableName(table_name) = cache {
-                let table_cache_key = format_full_table_name(
-                    &table_name.catalog_name,
-                    &table_name.schema_name,
-                    &table_name.table_name,
-                );
-                self.table_cache.invalidate(&table_cache_key).await;
-            }
-        }
-        Ok(())
-    }
+    cache_registry: LayeredCacheRegistryRef,
 }
 
 const CATALOG_CACHE_MAX_CAPACITY: u64 = 128;
-const TABLE_CACHE_MAX_CAPACITY: u64 = 65536;
-const TABLE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
-const TABLE_CACHE_TTI: Duration = Duration::from_secs(5 * 60);
 
 impl KvBackendCatalogManager {
-    pub async fn new(
+    pub fn new(
         mode: Mode,
         meta_client: Option<Arc<MetaClient>>,
         backend: KvBackendRef,
-        multi_cache_invalidator: Arc<MultiCacheInvalidator>,
+        cache_registry: LayeredCacheRegistryRef,
     ) -> Arc<Self> {
-        let table_cache: AsyncCache<String, TableRef> = CacheBuilder::new(TABLE_CACHE_MAX_CAPACITY)
-            .time_to_live(TABLE_CACHE_TTL)
-            .time_to_idle(TABLE_CACHE_TTI)
-            .build();
-        multi_cache_invalidator
-            .add_invalidator(Arc::new(TableCacheInvalidator::new(table_cache.clone())))
-            .await;
-
         Arc::new_cyclic(|me| Self {
             mode,
             meta_client,
-            partition_manager: Arc::new(PartitionRuleManager::new(backend.clone())),
+            partition_manager: Arc::new(PartitionRuleManager::new(
+                backend.clone(),
+                cache_registry
+                    .get()
+                    .expect("Failed to get table_route_cache"),
+            )),
             table_metadata_manager: Arc::new(TableMetadataManager::new(backend)),
             system_catalog: SystemCatalog {
                 catalog_manager: me.clone(),
@@ -131,13 +91,19 @@ impl KvBackendCatalogManager {
                     me.clone(),
                 )),
             },
-            table_cache,
+            cache_registry,
         })
     }
 
     /// Returns the server running mode.
     pub fn running_mode(&self) -> &Mode {
         &self.mode
+    }
+
+    pub fn view_info_cache(&self) -> Result<ViewInfoCacheRef> {
+        self.cache_registry.get().context(CacheNotFoundSnafu {
+            name: "view_info_cache",
+        })
     }
 
     /// Returns the `[MetaClient]`.
@@ -218,7 +184,7 @@ impl CatalogManager for KvBackendCatalogManager {
     }
 
     async fn schema_exists(&self, catalog: &str, schema: &str) -> Result<bool> {
-        if self.system_catalog.schema_exist(schema) {
+        if self.system_catalog.schema_exists(schema) {
             return Ok(true);
         }
 
@@ -230,7 +196,7 @@ impl CatalogManager for KvBackendCatalogManager {
     }
 
     async fn table_exists(&self, catalog: &str, schema: &str, table: &str) -> Result<bool> {
-        if self.system_catalog.table_exist(schema, table) {
+        if self.system_catalog.table_exists(schema, table) {
             return Ok(true);
         }
 
@@ -245,67 +211,32 @@ impl CatalogManager for KvBackendCatalogManager {
 
     async fn table(
         &self,
-        catalog: &str,
-        schema: &str,
+        catalog_name: &str,
+        schema_name: &str,
         table_name: &str,
     ) -> Result<Option<TableRef>> {
-        if let Some(table) = self.system_catalog.table(catalog, schema, table_name) {
+        if let Some(table) = self
+            .system_catalog
+            .table(catalog_name, schema_name, table_name)
+        {
             return Ok(Some(table));
         }
 
-        let init = async {
-            let table_name_key = TableNameKey::new(catalog, schema, table_name);
-            let Some(table_name_value) = self
-                .table_metadata_manager
-                .table_name_manager()
-                .get(table_name_key)
-                .await
-                .context(TableMetadataManagerSnafu)?
-            else {
-                return TableCacheNotGetSnafu {
-                    key: table_name_key.to_string(),
-                }
-                .fail();
-            };
-            let table_id = table_name_value.table_id();
+        let table_cache: TableCacheRef = self.cache_registry.get().context(CacheNotFoundSnafu {
+            name: "table_cache",
+        })?;
 
-            let Some(table_info_value) = self
-                .table_metadata_manager
-                .table_info_manager()
-                .get(table_id)
-                .await
-                .context(TableMetadataManagerSnafu)?
-                .map(|v| v.into_inner())
-            else {
-                return TableCacheNotGetSnafu {
-                    key: table_name_key.to_string(),
-                }
-                .fail();
-            };
-            build_table(table_info_value)
-        };
-
-        match self
-            .table_cache
-            .try_get_with_by_ref(&format_full_table_name(catalog, schema, table_name), init)
+        table_cache
+            .get_by_ref(&TableName {
+                catalog_name: catalog_name.to_string(),
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+            })
             .await
-        {
-            Ok(table) => Ok(Some(table)),
-            Err(err) => match err.as_ref() {
-                TableCacheNotGet { .. } => Ok(None),
-                _ => Err(err),
-            },
-        }
-        .map_err(|err| GetTableCache {
-            err_msg: err.to_string(),
-        })
+            .context(GetTableCacheSnafu)
     }
 
-    async fn tables<'a>(
-        &'a self,
-        catalog: &'a str,
-        schema: &'a str,
-    ) -> BoxStream<'a, Result<TableRef>> {
+    fn tables<'a>(&'a self, catalog: &'a str, schema: &'a str) -> BoxStream<'a, Result<TableRef>> {
         let sys_tables = try_stream!({
             // System tables
             let sys_table_names = self.system_catalog.table_names(schema);
@@ -386,11 +317,11 @@ impl SystemCatalog {
         }
     }
 
-    fn schema_exist(&self, schema: &str) -> bool {
+    fn schema_exists(&self, schema: &str) -> bool {
         schema == INFORMATION_SCHEMA_NAME
     }
 
-    fn table_exist(&self, schema: &str, table: &str) -> bool {
+    fn table_exists(&self, schema: &str, table: &str) -> bool {
         if schema == INFORMATION_SCHEMA_NAME {
             self.information_schema_provider.table(table).is_some()
         } else if schema == DEFAULT_SCHEMA_NAME {

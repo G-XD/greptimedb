@@ -15,6 +15,7 @@
 pub mod builder;
 mod grpc;
 mod influxdb;
+mod log_handler;
 mod opentsdb;
 mod otlp;
 mod prom_store;
@@ -24,7 +25,6 @@ pub mod standalone;
 
 use std::sync::Arc;
 
-use api::v1::meta::Role;
 use api::v1::{RowDeleteRequests, RowInsertRequests};
 use async_trait::async_trait;
 use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
@@ -49,6 +49,7 @@ use meta_client::MetaClientOptions;
 use operator::delete::DeleterRef;
 use operator::insert::InserterRef;
 use operator::statement::StatementExecutor;
+use pipeline::pipeline_operator::PipelineOperator;
 use prometheus::HistogramTimer;
 use query::metrics::OnDone;
 use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
@@ -67,7 +68,7 @@ use servers::prometheus_handler::PrometheusHandler;
 use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{
-    InfluxdbLineProtocolHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
+    InfluxdbLineProtocolHandler, LogHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
     PromStoreProtocolHandler, ScriptHandler,
 };
 use servers::server::ServerHandlers;
@@ -87,7 +88,7 @@ use crate::error::{
     PermissionSnafu, PlanStatementSnafu, Result, SqlExecInterceptedSnafu, StartServerSnafu,
     TableOperationSnafu,
 };
-use crate::frontend::{FrontendOptions, TomlSerializable};
+use crate::frontend::FrontendOptions;
 use crate::heartbeat::HeartbeatTask;
 use crate::script::ScriptExecutor;
 
@@ -101,6 +102,7 @@ pub trait FrontendInstance:
     + OpenTelemetryProtocolHandler
     + ScriptHandler
     + PrometheusHandler
+    + LogHandler
     + Send
     + Sync
     + 'static
@@ -109,12 +111,13 @@ pub trait FrontendInstance:
 }
 
 pub type FrontendInstanceRef = Arc<dyn FrontendInstance>;
-pub type StatementExecutorRef = Arc<StatementExecutor>;
 
 #[derive(Clone)]
 pub struct Instance {
+    options: FrontendOptions,
     catalog_manager: CatalogManagerRef,
     script_executor: Arc<ScriptExecutor>,
+    pipeline_operator: Arc<PipelineOperator>,
     statement_executor: Arc<StatementExecutor>,
     query_engine: QueryEngineRef,
     plugins: Plugins,
@@ -146,13 +149,7 @@ impl Instance {
         let ddl_channel_manager = ChannelManager::with_config(ddl_channel_config);
 
         let cluster_id = 0; // It is currently a reserved field and has not been enabled.
-        let member_id = 0; // Frontend does not need a member id.
-        let mut meta_client = MetaClientBuilder::new(cluster_id, member_id, Role::Frontend)
-            .enable_router()
-            .enable_store()
-            .enable_heartbeat()
-            .enable_procedure()
-            .enable_access_cluster_info()
+        let mut meta_client = MetaClientBuilder::frontend_default_options(cluster_id)
             .channel_manager(channel_manager)
             .ddl_channel_manager(ddl_channel_manager)
             .build();
@@ -193,14 +190,9 @@ impl Instance {
         Ok((kv_backend, procedure_manager))
     }
 
-    pub fn build_servers(
-        &mut self,
-        opts: impl Into<FrontendOptions> + TomlSerializable,
-        servers: ServerHandlers,
-    ) -> Result<()> {
-        let opts: FrontendOptions = opts.into();
+    pub fn build_servers(&mut self, servers: ServerHandlers) -> Result<()> {
         self.export_metrics_task =
-            ExportMetricsTask::try_new(&opts.export_metrics, Some(&self.plugins))
+            ExportMetricsTask::try_new(&self.options.export_metrics, Some(&self.plugins))
                 .context(StartServerSnafu)?;
 
         self.servers = servers;
@@ -514,11 +506,15 @@ pub fn check_permission(
         // These are executed by query engine, and will be checked there.
         Statement::Query(_) | Statement::Explain(_) | Statement::Tql(_) | Statement::Delete(_) => {}
         // database ops won't be checked
-        Statement::CreateDatabase(_) | Statement::ShowDatabases(_) | Statement::DropDatabase(_) => {
-        }
-
+        Statement::CreateDatabase(_)
+        | Statement::ShowDatabases(_)
+        | Statement::DropDatabase(_)
+        | Statement::DropFlow(_) => {}
         Statement::ShowCreateTable(stmt) => {
             validate_param(&stmt.table_name, query_ctx)?;
+        }
+        Statement::ShowCreateFlow(stmt) => {
+            validate_param(&stmt.flow_name, query_ctx)?;
         }
         Statement::CreateExternalTable(stmt) => {
             validate_param(&stmt.name, query_ctx)?;
@@ -526,6 +522,9 @@ pub fn check_permission(
         Statement::CreateFlow(stmt) => {
             // TODO: should also validate source table name here?
             validate_param(&stmt.sink_table_name, query_ctx)?;
+        }
+        Statement::CreateView(stmt) => {
+            validate_param(&stmt.name, query_ctx)?;
         }
         Statement::Alter(stmt) => {
             validate_param(stmt.table_name(), query_ctx)?;
@@ -546,7 +545,9 @@ pub fn check_permission(
             validate_param(&stmt.source_name, query_ctx)?;
         }
         Statement::DropTable(drop_stmt) => {
-            validate_param(drop_stmt.table_name(), query_ctx)?;
+            for table_name in drop_stmt.table_names() {
+                validate_param(table_name, query_ctx)?;
+            }
         }
         Statement::ShowTables(stmt) => {
             validate_db_permission!(stmt, query_ctx);
@@ -557,6 +558,7 @@ pub fn check_permission(
         Statement::ShowIndex(stmt) => {
             validate_db_permission!(stmt, query_ctx);
         }
+        Statement::ShowStatus(_stmt) => {}
         Statement::DescribeTable(stmt) => {
             validate_param(stmt.name(), query_ctx)?;
         }

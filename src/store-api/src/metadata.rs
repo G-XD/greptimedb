@@ -75,7 +75,8 @@ impl ColumnMetadata {
             column_def.datatype_extension.clone(),
         )
         .into();
-        ColumnSchema::new(column_def.name, data_type, column_def.is_nullable)
+        ColumnSchema::new(&column_def.name, data_type, column_def.is_nullable)
+            .with_time_index(column_def.semantic_type() == SemanticType::Timestamp)
             .with_default_constraint(default_constrain)
             .context(ConvertDatatypesSnafu)
     }
@@ -694,14 +695,20 @@ pub enum MetadataError {
     #[snafu(display("Invalid schema"))]
     InvalidSchema {
         source: datatypes::error::Error,
+        #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Invalid metadata, {}", reason))]
-    InvalidMeta { reason: String, location: Location },
+    InvalidMeta {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Failed to ser/de json object"))]
     SerdeJson {
+        #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
         error: serde_json::Error,
@@ -709,17 +716,23 @@ pub enum MetadataError {
 
     #[snafu(display("Failed to convert struct from datatypes"))]
     ConvertDatatypes {
+        #[snafu(implicit)]
         location: Location,
         source: datatypes::error::Error,
     },
 
     #[snafu(display("Invalid raw region request, err: {}", err))]
-    InvalidRawRegionRequest { err: String, location: Location },
+    InvalidRawRegionRequest {
+        err: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Invalid region request, region_id: {}, err: {}", region_id, err))]
     InvalidRegionRequest {
         region_id: RegionId,
         err: String,
+        #[snafu(implicit)]
         location: Location,
     },
 
@@ -727,17 +740,22 @@ pub enum MetadataError {
     SchemaProject {
         origin_schema: SchemaRef,
         projection: Vec<ColumnId>,
+        #[snafu(implicit)]
         location: Location,
         source: datatypes::Error,
     },
 
     #[snafu(display("Time index column not found"))]
-    TimeIndexNotFound { location: Location },
+    TimeIndexNotFound {
+        #[snafu(implicit)]
+        location: Location,
+    },
 
     #[snafu(display("Change column {} not exists in region: {}", column_name, region_id))]
     ChangeColumnNotFound {
         column_name: String,
         region_id: RegionId,
+        #[snafu(implicit)]
         location: Location,
     },
 }

@@ -18,10 +18,10 @@ use std::sync::{Arc, Weak};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use common_catalog::consts::INFORMATION_SCHEMA_PARTITIONS_TABLE_ID;
 use common_error::ext::BoxedError;
-use common_query::physical_plan::TaskContext;
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
 use common_time::datetime::DateTime;
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DfRecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream as DfPartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream as DfSendableRecordBatchStream;
@@ -243,7 +243,6 @@ impl InformationSchemaPartitionsBuilder {
         for schema_name in catalog_manager.schema_names(&catalog_name).await? {
             let table_info_stream = catalog_manager
                 .tables(&catalog_name, &schema_name)
-                .await
                 .try_filter_map(|t| async move {
                     let table_info = t.table_info();
                     if table_info.table_type == TableType::Temporary {

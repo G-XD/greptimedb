@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "benchmarks",
     "src/api",
     "src/auth",
     "src/catalog",
+    "src/cache",
     "src/client",
     "src/cmd",
     "src/common/base",
@@ -45,6 +45,7 @@ members = [
     "src/object-store",
     "src/operator",
     "src/partition",
+    "src/pipeline",
     "src/plugins",
     "src/promql",
     "src/puffin",
@@ -63,13 +64,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.2"
 edition = "2021"
 license = "Apache-2.0"
 
 [workspace.lints]
 clippy.print_stdout = "warn"
 clippy.print_stderr = "warn"
+clippy.dbg_macro = "warn"
 clippy.implicit_clone = "warn"
 clippy.readonly_write_lock = "allow"
 rust.unknown_lints = "deny"
@@ -99,16 +101,18 @@ bytemuck = "1.12"
 bytes = { version = "1.5", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
+config = "0.13.0"
 crossbeam-utils = "0.8"
 dashmap = "5.4"
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-common = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-expr = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-functions = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-optimizer = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-physical-expr = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-sql = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
-datafusion-substrait = { git = "https://github.com/apache/arrow-datafusion.git", rev = "34eda15b73a9e278af8844b30ed2f1c21c10359c" }
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-functions = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
+datafusion-substrait = { git = "https://github.com/apache/datafusion.git", rev = "729b356ef543ffcda6813c7b5373507a04ae0109" }
 derive_builder = "0.12"
 dotenv = "0.15"
 # TODO(LFC): Wait for https://github.com/etcdv3/etcd-client/pull/76
@@ -116,7 +120,7 @@ etcd-client = { git = "https://github.com/MichaelScofield/etcd-client.git", rev 
 fst = "0.4.7"
 futures = "0.3"
 futures-util = "0.3"
-greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "f699e240f7a6c83f139dabac8669714f08513120" }
+greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "a70a6af9c69e40f9a918936a48717343402b4393" }
 humantime = "2.1"
 humantime-serde = "1.1"
 itertools = "0.10"
@@ -136,28 +140,31 @@ parquet = { version = "51.0.0", default-features = false, features = ["arrow", "
 paste = "1.0"
 pin-project = "1.0"
 prometheus = { version = "0.13.3", features = ["process"] }
+promql-parser = { version = "0.4" }
 prost = "0.12"
 raft-engine = { version = "0.4.1", default-features = false }
 rand = "0.8"
 regex = "1.8"
 regex-automata = { version = "0.4" }
-reqwest = { version = "0.11", default-features = false, features = [
+reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls-native-roots",
     "stream",
     "multipart",
 ] }
 rskafka = "0.5"
+rstest = "0.21"
+rstest_reuse = "0.7"
 rust_decimal = "1.33"
 schemars = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 serde_with = "3"
 smallvec = { version = "1", features = ["serde"] }
-snafu = "0.7"
+snafu = "0.8"
 sysinfo = "0.30"
 # on branch v0.44.x
-sqlparser = { git = "https://github.com/GreptimeTeam/sqlparser-rs.git", rev = "c919990bf62ad38d2b0c0a3bc90b26ad919d51b0", features = [
+sqlparser = { git = "https://github.com/GreptimeTeam/sqlparser-rs.git", rev = "54a267ac89c09b11c0c88934690530807185d3e7", features = [
     "visitor",
 ] }
 strum = { version = "0.25", features = ["derive"] }
@@ -166,13 +173,15 @@ tokio = { version = "1.36", features = ["full"] }
 tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7", features = ["io-util", "compat"] }
 toml = "0.8.8"
-tonic = { version = "0.11", features = ["tls"] }
+tonic = { version = "0.11", features = ["tls", "gzip", "zstd"] }
+tower = { version = "0.4" }
 uuid = { version = "1.7", features = ["serde", "v4", "fast-rng"] }
 zstd = "0.13"
 
 ## workspaces members
 api = { path = "src/api" }
 auth = { path = "src/auth" }
+cache = { path = "src/cache" }
 catalog = { path = "src/catalog" }
 client = { path = "src/client" }
 cmd = { path = "src/cmd" }
@@ -204,6 +213,7 @@ common-wal = { path = "src/common/wal" }
 datanode = { path = "src/datanode" }
 datatypes = { path = "src/datatypes" }
 file-engine = { path = "src/file-engine" }
+flow = { path = "src/flow" }
 frontend = { path = "src/frontend" }
 index = { path = "src/index" }
 log-store = { path = "src/log-store" }
@@ -214,6 +224,7 @@ mito2 = { path = "src/mito2" }
 object-store = { path = "src/object-store" }
 operator = { path = "src/operator" }
 partition = { path = "src/partition" }
+pipeline = { path = "src/pipeline" }
 plugins = { path = "src/plugins" }
 promql = { path = "src/promql" }
 puffin = { path = "src/puffin" }
@@ -225,8 +236,6 @@ sql = { path = "src/sql" }
 store-api = { path = "src/store-api" }
 substrait = { path = "src/common/substrait" }
 table = { path = "src/table" }
-# TODO some code depends on this
-tests-integration = { path = "tests-integration" }
 
 [workspace.dependencies.meter-macros]
 git = "https://github.com/GreptimeTeam/greptime-meter.git"
@@ -241,3 +250,15 @@ strip = true
 lto = "thin"
 debug = false
 incremental = false
+
+[profile.ci]
+inherits = "dev"
+strip = true
+
+[profile.dev.package.sqlness-runner]
+debug = false
+strip = true
+
+[profile.dev.package.tests-fuzz]
+debug = false
+strip = true

@@ -21,11 +21,11 @@ use common_config::Mode;
 use common_error::ext::BoxedError;
 use common_meta::cluster::{ClusterInfo, NodeInfo, NodeStatus};
 use common_meta::peer::Peer;
-use common_query::physical_plan::TaskContext;
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
-use common_telemetry::logging::warn;
+use common_telemetry::warn;
 use common_time::timestamp::Timestamp;
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DfRecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream as DfPartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream as DfSendableRecordBatchStream;
@@ -241,8 +241,8 @@ impl InformationSchemaClusterInfoBuilder {
             return;
         }
 
-        if peer_type == "FRONTEND" {
-            // Always set peer_id to be -1 for frontends
+        if peer_type == "FRONTEND" || peer_type == "METASRV" {
+            // Always set peer_id to be -1 for frontends and metasrvs
             self.peer_ids.push(Some(-1));
         } else {
             self.peer_ids.push(Some(node_info.peer.id as i64));

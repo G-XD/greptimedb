@@ -34,15 +34,16 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
-use crate::error::Result;
+use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::key_values::KeyValue;
 use crate::memtable::partition_tree::metrics::WriteMetrics;
 use crate::memtable::partition_tree::tree::PartitionTree;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, KeyValues, Memtable, MemtableBuilder, MemtableId,
-    MemtableRef, MemtableStats,
+    AllocTracker, BoxedBatchIterator, BulkPart, IterBuilder, KeyValues, Memtable, MemtableBuilder,
+    MemtableId, MemtableRange, MemtableRangeContext, MemtableRef, MemtableStats,
 };
+use crate::region::options::MergeMode;
 
 /// Use `1/DICTIONARY_SIZE_FACTOR` of OS memory as dictionary size.
 pub(crate) const DICTIONARY_SIZE_FACTOR: u64 = 8;
@@ -80,6 +81,9 @@ pub struct PartitionTreeConfig {
     pub dedup: bool,
     /// Total bytes of dictionary to keep in fork.
     pub fork_dictionary_bytes: ReadableSize,
+    /// Merge mode of the tree.
+    #[serde(skip_deserializing)]
+    pub merge_mode: MergeMode,
 }
 
 impl Default for PartitionTreeConfig {
@@ -98,6 +102,7 @@ impl Default for PartitionTreeConfig {
             data_freeze_threshold: 131072,
             dedup: true,
             fork_dictionary_bytes,
+            merge_mode: MergeMode::LastRow,
         }
     }
 }
@@ -105,7 +110,7 @@ impl Default for PartitionTreeConfig {
 /// Memtable based on a partition tree.
 pub struct PartitionTreeMemtable {
     id: MemtableId,
-    tree: PartitionTree,
+    tree: Arc<PartitionTree>,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
     min_timestamp: AtomicI64,
@@ -148,12 +153,35 @@ impl Memtable for PartitionTreeMemtable {
         res
     }
 
+    fn write_bulk(&self, _part: BulkPart) -> Result<()> {
+        UnsupportedOperationSnafu {
+            err_msg: "PartitionTreeMemtable does not support write_bulk",
+        }
+        .fail()
+    }
+
     fn iter(
         &self,
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
     ) -> Result<BoxedBatchIterator> {
         self.tree.read(projection, predicate)
+    }
+
+    fn ranges(
+        &self,
+        projection: Option<&[ColumnId]>,
+        predicate: Option<Predicate>,
+    ) -> Vec<MemtableRange> {
+        let projection = projection.map(|ids| ids.to_vec());
+        let builder = Box::new(PartitionTreeIterBuilder {
+            tree: self.tree.clone(),
+            projection,
+            predicate,
+        });
+        let context = Arc::new(MemtableRangeContext::new(self.id, builder));
+
+        vec![MemtableRange::new(context)]
     }
 
     fn is_empty(&self) -> bool {
@@ -224,7 +252,7 @@ impl PartitionTreeMemtable {
 
         Self {
             id,
-            tree,
+            tree: Arc::new(tree),
             alloc_tracker,
             max_timestamp: AtomicI64::new(i64::MIN),
             min_timestamp: AtomicI64::new(i64::MAX),
@@ -309,16 +337,39 @@ impl MemtableBuilder for PartitionTreeMemtableBuilder {
     }
 }
 
+struct PartitionTreeIterBuilder {
+    tree: Arc<PartitionTree>,
+    projection: Option<Vec<ColumnId>>,
+    predicate: Option<Predicate>,
+}
+
+impl IterBuilder for PartitionTreeIterBuilder {
+    fn build(&self) -> Result<BoxedBatchIterator> {
+        self.tree
+            .read(self.projection.as_deref(), self.predicate.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use api::v1::value::ValueData;
+    use api::v1::{Row, Rows, SemanticType};
     use common_time::Timestamp;
     use datafusion_common::{Column, ScalarValue};
     use datafusion_expr::{BinaryExpr, Expr, Operator};
+    use datatypes::data_type::ConcreteDataType;
     use datatypes::scalars::ScalarVector;
+    use datatypes::schema::ColumnSchema;
+    use datatypes::value::Value;
     use datatypes::vectors::Int64Vector;
+    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
+    use store_api::storage::RegionId;
 
     use super::*;
-    use crate::test_util::memtable_util::{self, collect_iter_timestamps};
+    use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+    use crate::test_util::memtable_util::{
+        self, collect_iter_timestamps, region_metadata_to_row_schema,
+    };
 
     #[test]
     fn test_memtable_sorted_input() {
@@ -543,7 +594,7 @@ mod tests {
                 right: Box::new(Expr::Literal(ScalarValue::UInt32(Some(i)))),
             });
             let iter = memtable
-                .iter(None, Some(Predicate::new(vec![expr.into()])))
+                .iter(None, Some(Predicate::new(vec![expr])))
                 .unwrap();
             let read = collect_iter_timestamps(iter);
             assert_eq!(timestamps, read);
@@ -561,5 +612,167 @@ mod tests {
         let config: PartitionTreeConfig = serde_json::from_str(&json).unwrap();
         assert!(config.dedup);
         assert_eq!(PartitionTreeConfig::default(), config);
+    }
+
+    fn metadata_for_metric_engine() -> RegionMetadataRef {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(123, 456));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "__table_id",
+                    ConcreteDataType::uint32_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 2147483652,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "__tsid",
+                    ConcreteDataType::uint64_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 2147483651,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "test_label",
+                    ConcreteDataType::string_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 2,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "greptime_timestamp",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 0,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "greptime_value",
+                    ConcreteDataType::float64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 1,
+            })
+            .primary_key(vec![2147483652, 2147483651, 2]);
+        let region_metadata = builder.build().unwrap();
+        Arc::new(region_metadata)
+    }
+
+    fn build_key_values(
+        metadata: RegionMetadataRef,
+        labels: &[&str],
+        table_id: &[u32],
+        ts_id: &[u64],
+        ts: &[i64],
+        values: &[f64],
+        sequence: u64,
+    ) -> KeyValues {
+        let column_schema = region_metadata_to_row_schema(&metadata);
+
+        let rows = ts
+            .iter()
+            .zip(table_id.iter())
+            .zip(ts_id.iter())
+            .zip(labels.iter())
+            .zip(values.iter())
+            .map(|((((ts, table_id), ts_id), label), val)| Row {
+                values: vec![
+                    api::v1::Value {
+                        value_data: Some(ValueData::U32Value(*table_id)),
+                    },
+                    api::v1::Value {
+                        value_data: Some(ValueData::U64Value(*ts_id)),
+                    },
+                    api::v1::Value {
+                        value_data: Some(ValueData::StringValue(label.to_string())),
+                    },
+                    api::v1::Value {
+                        value_data: Some(ValueData::TimestampMillisecondValue(*ts)),
+                    },
+                    api::v1::Value {
+                        value_data: Some(ValueData::F64Value(*val)),
+                    },
+                ],
+            })
+            .collect();
+        let mutation = api::v1::Mutation {
+            op_type: 1,
+            sequence,
+            rows: Some(Rows {
+                schema: column_schema,
+                rows,
+            }),
+        };
+        KeyValues::new(metadata.as_ref(), mutation).unwrap()
+    }
+
+    #[test]
+    fn test_write_freeze() {
+        let metadata = metadata_for_metric_engine();
+        let memtable = PartitionTreeMemtableBuilder::new(
+            PartitionTreeConfig {
+                index_max_keys_per_shard: 40,
+                ..Default::default()
+            },
+            None,
+        )
+        .build(1, &metadata);
+
+        let codec = McmpRowCodec::new(
+            metadata
+                .primary_key_columns()
+                .map(|c| SortField::new(c.column_schema.data_type.clone()))
+                .collect(),
+        );
+
+        memtable
+            .write(&build_key_values(
+                metadata.clone(),
+                &["daily", "10min", "daily", "10min"],
+                &[1025, 1025, 1025, 1025],
+                &[
+                    16442255374049317291,
+                    5686004715529701024,
+                    16442255374049317291,
+                    5686004715529701024,
+                ],
+                &[1712070000000, 1712717731000, 1712761200000, 1712761200000],
+                &[0.0, 0.0, 0.0, 0.0],
+                1,
+            ))
+            .unwrap();
+
+        memtable.freeze().unwrap();
+        let new_memtable = memtable.fork(2, &metadata);
+
+        new_memtable
+            .write(&build_key_values(
+                metadata.clone(),
+                &["10min"],
+                &[1025],
+                &[5686004715529701024],
+                &[1714643131000],
+                &[0.1],
+                2,
+            ))
+            .unwrap();
+
+        let mut reader = new_memtable.iter(None, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let pk = codec.decode(batch.primary_key()).unwrap();
+        if let Value::String(s) = &pk[2] {
+            assert_eq!("10min", s.as_utf8());
+        } else {
+            unreachable!()
+        }
     }
 }

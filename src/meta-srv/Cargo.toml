@@ -16,6 +16,7 @@ async-trait = "0.1"
 client.workspace = true
 common-base.workspace = true
 common-catalog.workspace = true
+common-config.workspace = true
 common-error.workspace = true
 common-greptimedb-telemetry.workspace = true
 common-grpc.workspace = true
@@ -25,6 +26,7 @@ common-procedure.workspace = true
 common-runtime.workspace = true
 common-telemetry.workspace = true
 common-time.workspace = true
+common-version.workspace = true
 common-wal.workspace = true
 dashmap.workspace = true
 datatypes.workspace = true
@@ -53,7 +55,7 @@ tokio.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 toml.workspace = true
 tonic.workspace = true
-tower = "0.4"
+tower.workspace = true
 typetag = "0.2"
 url = "2.3"
 

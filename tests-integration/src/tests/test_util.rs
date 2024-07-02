@@ -15,6 +15,7 @@
 use std::env;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use client::OutputData;
 use common_query::Output;
 use common_recordbatch::util;
@@ -36,7 +37,8 @@ pub(crate) trait RebuildableMockInstance: MockInstance {
     async fn rebuild(&mut self);
 }
 
-pub(crate) trait MockInstance: Sync + Send {
+#[async_trait]
+pub trait MockInstance: Sync + Send {
     fn frontend(&self) -> Arc<Instance>;
 
     fn is_distributed_mode(&self) -> bool;
@@ -106,7 +108,7 @@ impl MockInstanceBuilder {
                     unreachable!()
                 };
                 let GreptimeDbStandalone {
-                    mix_options,
+                    opts,
                     guard,
                     kv_backend,
                     procedure_manager,
@@ -114,7 +116,7 @@ impl MockInstanceBuilder {
                 } = instance;
                 MockInstanceImpl::Standalone(
                     builder
-                        .build_with(kv_backend, guard, mix_options, procedure_manager, false)
+                        .build_with(kv_backend, guard, opts, procedure_manager, false)
                         .await,
                 )
             }

@@ -17,13 +17,16 @@
 #![feature(async_closure)]
 #![feature(let_chains)]
 #![feature(extract_if)]
+#![feature(hash_extract_if)]
 
+pub mod cache;
 pub mod cache_invalidator;
 pub mod cluster;
 pub mod ddl;
 pub mod ddl_manager;
 pub mod distributed_time_constants;
 pub mod error;
+pub mod flow_name;
 pub mod heartbeat;
 pub mod instruction;
 pub mod key;
@@ -37,7 +40,6 @@ pub mod region_keeper;
 pub mod rpc;
 pub mod sequence;
 pub mod state_store;
-pub mod table_name;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_util;
 pub mod util;

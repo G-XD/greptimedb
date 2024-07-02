@@ -26,7 +26,7 @@ use common_error::ext::BoxedError;
 use common_query::prelude::GREPTIME_PHYSICAL_TABLE;
 use common_query::Output;
 use common_recordbatch::RecordBatches;
-use common_telemetry::{logging, tracing};
+use common_telemetry::{debug, tracing};
 use operator::insert::InserterRef;
 use operator::statement::StatementExecutor;
 use prost::Message;
@@ -119,7 +119,7 @@ impl Instance {
         let logical_plan =
             prom_store::query_to_plan(dataframe, query).context(PromStoreRemoteQueryPlanSnafu)?;
 
-        logging::debug!(
+        debug!(
             "Prometheus remote read, table: {}, logical plan: {}",
             table_name,
             logical_plan.display_indent(),
@@ -218,7 +218,7 @@ impl PromStoreProtocolHandler for Instance {
                     let plan = output.meta.plan.clone();
                     query_results.push(to_query_result(&table_name, output).await?);
                     if let Some(ref plan) = plan {
-                        collect_plan_metrics(plan.clone(), &mut [&mut map]);
+                        collect_plan_metrics(plan, &mut [&mut map]);
                     }
                 }
 

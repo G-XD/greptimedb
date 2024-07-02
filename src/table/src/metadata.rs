@@ -647,8 +647,6 @@ pub struct TableInfo {
     /// Id and version of the table.
     #[builder(default, setter(into))]
     pub ident: TableIdent,
-
-    // TODO(LFC): Remove the catalog, schema and table names from TableInfo.
     /// Name of the table.
     #[builder(setter(into))]
     pub name: String,
@@ -722,7 +720,7 @@ impl From<TableId> for TableIdent {
 }
 
 /// Struct used to serialize and deserialize [`TableMeta`].
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Default)]
 pub struct RawTableMeta {
     pub schema: RawSchema,
     /// The indices of columns in primary key. Note that the index of timestamp column

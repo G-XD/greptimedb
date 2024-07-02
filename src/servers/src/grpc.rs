@@ -14,6 +14,7 @@
 
 mod authorize;
 pub mod builder;
+mod cancellation;
 mod database;
 pub mod flight;
 pub mod greptime_handler;
@@ -26,17 +27,19 @@ use std::net::SocketAddr;
 use api::v1::health_check_server::{HealthCheck, HealthCheckServer};
 use api::v1::{HealthCheckRequest, HealthCheckResponse};
 use async_trait::async_trait;
+use common_base::readable_size::ReadableSize;
 use common_grpc::channel_manager::{
     DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE, DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
 };
-use common_telemetry::logging::info;
-use common_telemetry::{error, warn};
+use common_telemetry::{error, info, warn};
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::sync::Mutex;
 use tonic::transport::server::{Routes, TcpIncoming};
+use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 use tonic_reflection::server::{ServerReflection, ServerReflectionServer};
 
@@ -45,8 +48,42 @@ use crate::error::{
 };
 use crate::metrics::MetricsMiddlewareLayer;
 use crate::server::Server;
+use crate::tls::TlsOption;
 
 type TonicResult<T> = std::result::Result<T, Status>;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrpcOptions {
+    pub addr: String,
+    pub hostname: String,
+    /// Max gRPC receiving(decoding) message size
+    pub max_recv_message_size: ReadableSize,
+    /// Max gRPC sending(encoding) message size
+    pub max_send_message_size: ReadableSize,
+    pub runtime_size: usize,
+    #[serde(default = "Default::default")]
+    pub tls: TlsOption,
+}
+
+impl Default for GrpcOptions {
+    fn default() -> Self {
+        Self {
+            addr: "127.0.0.1:4001".to_string(),
+            hostname: "127.0.0.1".to_string(),
+            max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
+            max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
+            runtime_size: 8,
+            tls: TlsOption::default(),
+        }
+    }
+}
+
+impl GrpcOptions {
+    pub fn with_addr(mut self, addr: &str) -> Self {
+        self.addr = addr.to_string();
+        self
+    }
+}
 
 pub struct GrpcServer {
     // states
@@ -56,6 +93,8 @@ pub struct GrpcServer {
     serve_state: Mutex<Option<Receiver<Result<()>>>>,
     // handlers
     routes: Mutex<Option<Routes>>,
+    // tls config
+    tls_config: Option<ServerTlsConfig>,
 }
 
 /// Grpc Server configuration
@@ -65,6 +104,7 @@ pub struct GrpcServerConfig {
     pub max_recv_message_size: usize,
     // Max gRPC sending(encoding) message size
     pub max_send_message_size: usize,
+    pub tls: TlsOption,
 }
 
 impl Default for GrpcServerConfig {
@@ -72,6 +112,7 @@ impl Default for GrpcServerConfig {
         Self {
             max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE.as_bytes() as usize,
             max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE.as_bytes() as usize,
+            tls: TlsOption::default(),
         }
     }
 }
@@ -173,8 +214,11 @@ impl Server for GrpcServer {
             .layer(MetricsMiddlewareLayer)
             .into_inner();
 
-        let builder = tonic::transport::Server::builder()
-            .layer(metrics_layer)
+        let mut builder = tonic::transport::Server::builder().layer(metrics_layer);
+        if let Some(tls_config) = self.tls_config.clone() {
+            builder = builder.tls_config(tls_config).context(StartGrpcSnafu)?;
+        }
+        let builder = builder
             .add_routes(routes)
             .add_service(self.create_healthcheck_service())
             .add_service(self.create_reflection_service());

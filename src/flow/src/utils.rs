@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
+use common_telemetry::debug;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
@@ -31,6 +32,7 @@ use crate::repr::{value_to_internal_ts, Diff, DiffRow, Duration, KeyValDiffRow, 
 pub type Batch = BTreeMap<Row, SmallVec<[DiffRow; 2]>>;
 
 /// A spine of batches, arranged by timestamp
+/// TODO(discord9): consider internally index by key, value, and timestamp for faster lookup
 pub type Spine = BTreeMap<Timestamp, Batch>;
 
 /// Determine when should a key expire according to it's event timestamp in key.
@@ -38,7 +40,7 @@ pub type Spine = BTreeMap<Timestamp, Batch>;
 /// If a key is expired, any future updates to it should be ignored.
 ///
 /// Note that key is expired by it's event timestamp (contained in the key), not by the time it's inserted (system timestamp).
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct KeyExpiryManager {
     /// A map from event timestamp to key, used for expire keys.
     event_ts_to_key: BTreeMap<Timestamp, BTreeSet<Row>>,
@@ -51,6 +53,17 @@ pub struct KeyExpiryManager {
 }
 
 impl KeyExpiryManager {
+    pub fn new(
+        key_expiration_duration: Option<Duration>,
+        event_timestamp_from_row: Option<ScalarExpr>,
+    ) -> Self {
+        Self {
+            event_ts_to_key: Default::default(),
+            key_expiration_duration,
+            event_timestamp_from_row,
+        }
+    }
+
     /// Extract event timestamp from key row.
     ///
     /// If no expire state is set, return None.
@@ -74,8 +87,35 @@ impl KeyExpiryManager {
     ///
     /// - If given key is expired by now (that is less than `now - expiry_duration`), return the amount of time it's expired.
     /// - If it's not expired, return None
-    pub fn update_event_ts(
+    pub fn get_expire_duration_and_update_event_ts(
         &mut self,
+        now: Timestamp,
+        row: &Row,
+    ) -> Result<Option<Duration>, EvalError> {
+        let Some(event_ts) = self.extract_event_ts(row)? else {
+            return Ok(None);
+        };
+
+        self.event_ts_to_key
+            .entry(event_ts)
+            .or_default()
+            .insert(row.clone());
+
+        if let Some(expire_time) = self.compute_expiration_timestamp(now) {
+            if expire_time > event_ts {
+                // return how much time it's expired
+                return Ok(Some(expire_time - event_ts));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get the expire duration of a key, if it's expired by now.
+    ///
+    /// Return None if the key is not expired
+    pub fn get_expire_duration(
+        &self,
         now: Timestamp,
         row: &Row,
     ) -> Result<Option<Duration>, EvalError> {
@@ -90,10 +130,6 @@ impl KeyExpiryManager {
             }
         }
 
-        self.event_ts_to_key
-            .entry(event_ts)
-            .or_default()
-            .insert(row.clone());
         Ok(None)
     }
 
@@ -121,7 +157,7 @@ impl KeyExpiryManager {
 ///
 /// Note the two way arrow between reduce operator and arrange, it's because reduce operator need to query existing state
 /// and also need to update existing state.
-#[derive(Debug, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Arrangement {
     /// A name or identifier for the arrangement which can be used for debugging or logging purposes.
     /// This field is not critical to the functionality but aids in monitoring and management of arrangements.
@@ -141,7 +177,7 @@ pub struct Arrangement {
     ///
     /// Since updates typically occur as a delete followed by an insert, a small vector of size 2 is used to store updates for efficiency.
     ///
-    /// TODO: Consider balancing the batch size?
+    /// TODO(discord9): Consider balancing the batch size?
     spine: Spine,
 
     /// Indicates whether the arrangement maintains a complete history of updates.
@@ -177,6 +213,14 @@ impl Arrangement {
         }
     }
 
+    pub fn get_expire_state(&self) -> Option<&KeyExpiryManager> {
+        self.expire_state.as_ref()
+    }
+
+    pub fn set_expire_state(&mut self, expire_state: KeyExpiryManager) {
+        self.expire_state = Some(expire_state);
+    }
+
     /// Apply updates into spine, with no respect of whether the updates are in futures, past, or now.
     ///
     /// Return the maximum expire time (already expire by how much time) of all updates if any keys is already expired.
@@ -192,8 +236,12 @@ impl Arrangement {
         for ((key, val), update_ts, diff) in updates {
             // check if the key is expired
             if let Some(s) = &mut self.expire_state {
-                if let Some(expired_by) = s.update_event_ts(now, &key)? {
+                if let Some(expired_by) = s.get_expire_duration_and_update_event_ts(now, &key)? {
                     max_expired_by = max_expired_by.max(Some(expired_by));
+                    debug!(
+                        "Expired key: {:?}, expired by: {:?} with time being now={}",
+                        key, expired_by, now
+                    );
                     continue;
                 }
             }
@@ -319,7 +367,9 @@ impl Arrangement {
             for (key, updates) in batch {
                 // check if the key is expired
                 if let Some(s) = &mut self.expire_state {
-                    if let Some(expired_by) = s.update_event_ts(now, &key)? {
+                    if let Some(expired_by) =
+                        s.get_expire_duration_and_update_event_ts(now, &key)?
+                    {
                         max_expired_by = max_expired_by.max(Some(expired_by));
                         continue;
                     }
@@ -523,6 +573,10 @@ impl ArrangeHandler {
 
     pub fn set_full_arrangement(&self, full: bool) {
         self.write().full_arrangement = full;
+    }
+
+    pub fn is_full_arrangement(&self) -> bool {
+        self.read().full_arrangement
     }
 }
 

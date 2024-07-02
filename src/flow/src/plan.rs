@@ -18,29 +18,34 @@
 mod join;
 mod reduce;
 
+use std::collections::BTreeSet;
+
 use datatypes::arrow::ipc::Map;
 use serde::{Deserialize, Serialize};
 
-use crate::adapter::error::Error;
+use crate::error::Error;
 use crate::expr::{
-    AggregateExpr, EvalError, Id, LocalId, MapFilterProject, SafeMfpPlan, ScalarExpr, TypedExpr,
+    AggregateExpr, EvalError, GlobalId, Id, LocalId, MapFilterProject, SafeMfpPlan, ScalarExpr,
+    TypedExpr,
 };
 use crate::plan::join::JoinPlan;
 pub(crate) use crate::plan::reduce::{AccumulablePlan, AggrWithIndex, KeyValPlan, ReducePlan};
-use crate::repr::{ColumnType, DiffRow, RelationType};
+use crate::repr::{ColumnType, DiffRow, RelationDesc, RelationType};
 
 /// A plan for a dataflow component. But with type to indicate the output type of the relation.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct TypedPlan {
     /// output type of the relation
-    pub typ: RelationType,
+    pub schema: RelationDesc,
     /// The untyped plan.
     pub plan: Plan,
 }
 
 impl TypedPlan {
     /// directly apply a mfp to the plan
-    pub fn mfp(self, mfp: MapFilterProject) -> Result<Self, Error> {
+    pub fn mfp(self, mfp: SafeMfpPlan) -> Result<Self, Error> {
+        let new_type = self.schema.apply_mfp(&mfp)?;
+        let mfp = mfp.mfp;
         let plan = match self.plan {
             Plan::Mfp {
                 input,
@@ -50,27 +55,30 @@ impl TypedPlan {
                 mfp: MapFilterProject::compose(old_mfp, mfp)?,
             },
             _ => Plan::Mfp {
-                input: Box::new(self.plan),
+                input: Box::new(self),
                 mfp,
             },
         };
         Ok(TypedPlan {
-            typ: self.typ,
+            schema: new_type,
             plan,
         })
     }
 
     /// project the plan to the given expressions
     pub fn projection(self, exprs: Vec<TypedExpr>) -> Result<Self, Error> {
-        let input_arity = self.typ.column_types.len();
+        let input_arity = self.schema.typ.column_types.len();
         let output_arity = exprs.len();
-        let (exprs, expr_typs): (Vec<_>, Vec<_>) = exprs
+        let (exprs, _expr_typs): (Vec<_>, Vec<_>) = exprs
             .into_iter()
             .map(|TypedExpr { expr, typ }| (expr, typ))
             .unzip();
         let mfp = MapFilterProject::new(input_arity)
             .map(exprs)?
-            .project(input_arity..input_arity + output_arity)?;
+            .project(input_arity..input_arity + output_arity)?
+            .into_safe();
+        let out_typ = self.schema.apply_mfp(&mfp)?;
+        let mfp = mfp.mfp;
         // special case for mfp to compose when the plan is already mfp
         let plan = match self.plan {
             Plan::Mfp {
@@ -81,16 +89,19 @@ impl TypedPlan {
                 mfp: MapFilterProject::compose(old_mfp, mfp)?,
             },
             _ => Plan::Mfp {
-                input: Box::new(self.plan),
+                input: Box::new(self),
                 mfp,
             },
         };
-        let typ = RelationType::new(expr_typs);
-        Ok(TypedPlan { typ, plan })
+        Ok(TypedPlan {
+            schema: out_typ,
+            plan,
+        })
     }
 
     /// Add a new filter to the plan, will filter out the records that do not satisfy the filter
     pub fn filter(self, filter: TypedExpr) -> Result<Self, Error> {
+        let typ = self.schema.clone();
         let plan = match self.plan {
             Plan::Mfp {
                 input,
@@ -100,21 +111,17 @@ impl TypedPlan {
                 mfp: old_mfp.filter(vec![filter.expr])?,
             },
             _ => Plan::Mfp {
-                input: Box::new(self.plan),
-                mfp: MapFilterProject::new(self.typ.column_types.len())
-                    .filter(vec![filter.expr])?,
+                input: Box::new(self),
+                mfp: MapFilterProject::new(typ.typ.column_types.len()).filter(vec![filter.expr])?,
             },
         };
-        Ok(TypedPlan {
-            typ: self.typ,
-            plan,
-        })
+        Ok(TypedPlan { schema: typ, plan })
     }
 }
 
 /// TODO(discord9): support `TableFunc`（by define FlatMap that map 1 to n)
 /// Plan describe how to transform data in dataflow
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Plan {
     /// A constant collection of rows.
     Constant { rows: Vec<DiffRow> },
@@ -132,20 +139,20 @@ pub enum Plan {
     /// }
     Let {
         id: LocalId,
-        value: Box<Plan>,
-        body: Box<Plan>,
+        value: Box<TypedPlan>,
+        body: Box<TypedPlan>,
     },
     /// Map, Filter, and Project operators. Chained together.
     Mfp {
         /// The input collection.
-        input: Box<Plan>,
+        input: Box<TypedPlan>,
         /// Linear operator to apply to each record.
         mfp: MapFilterProject,
     },
     /// Reduce operator, aggregation by key assembled from KeyValPlan
     Reduce {
         /// The input collection.
-        input: Box<Plan>,
+        input: Box<TypedPlan>,
         /// A plan for changing input records into key, value pairs.
         key_val_plan: KeyValPlan,
         /// A plan for performing the reduce.
@@ -161,7 +168,7 @@ pub enum Plan {
     /// strategy we will use, and any pushed down per-record work.
     Join {
         /// An ordered list of inputs that will be joined.
-        inputs: Vec<Plan>,
+        inputs: Vec<TypedPlan>,
         /// Detailed information about the implementation of the join.
         ///
         /// This includes information about the implementation strategy, but also
@@ -177,8 +184,56 @@ pub enum Plan {
     /// implementing the "distinct" operator.
     Union {
         /// The input collections
-        inputs: Vec<Plan>,
+        inputs: Vec<TypedPlan>,
         /// Whether to consolidate the output, e.g., cancel negated records.
         consolidate_output: bool,
     },
+}
+
+impl Plan {
+    /// Find all the used collection in the plan
+    pub fn find_used_collection(&self) -> BTreeSet<GlobalId> {
+        fn recur_find_use(plan: &Plan, used: &mut BTreeSet<GlobalId>) {
+            match plan {
+                Plan::Get { id } => {
+                    match id {
+                        Id::Local(_) => (),
+                        Id::Global(g) => {
+                            used.insert(*g);
+                        }
+                    };
+                }
+                Plan::Let { value, body, .. } => {
+                    recur_find_use(&value.plan, used);
+                    recur_find_use(&body.plan, used);
+                }
+                Plan::Mfp { input, .. } => {
+                    recur_find_use(&input.plan, used);
+                }
+                Plan::Reduce { input, .. } => {
+                    recur_find_use(&input.plan, used);
+                }
+                Plan::Join { inputs, .. } => {
+                    for input in inputs {
+                        recur_find_use(&input.plan, used);
+                    }
+                }
+                Plan::Union { inputs, .. } => {
+                    for input in inputs {
+                        recur_find_use(&input.plan, used);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut ret = Default::default();
+        recur_find_use(self, &mut ret);
+        ret
+    }
+}
+
+impl Plan {
+    pub fn with_types(self, schema: RelationDesc) -> TypedPlan {
+        TypedPlan { schema, plan: self }
+    }
 }

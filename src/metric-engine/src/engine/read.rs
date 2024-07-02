@@ -15,14 +15,12 @@
 use std::sync::Arc;
 
 use api::v1::SemanticType;
-use common_query::logical_plan::Expr;
-use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::{error, info, tracing};
-use datafusion::logical_expr;
+use datafusion::logical_expr::{self, Expr};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadataBuilder, RegionMetadataRef};
 use store_api::metric_engine_consts::DATA_SCHEMA_TABLE_ID_COLUMN_NAME;
-use store_api::region_engine::RegionEngine;
+use store_api::region_engine::{RegionEngine, RegionScannerRef};
 use store_api::storage::{RegionId, ScanRequest};
 
 use crate::engine::MetricEngineInner;
@@ -38,7 +36,7 @@ impl MetricEngineInner {
         &self,
         region_id: RegionId,
         request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<RegionScannerRef> {
         let is_reading_physical_region = self.is_physical_region(region_id);
 
         if is_reading_physical_region {
@@ -56,7 +54,7 @@ impl MetricEngineInner {
         &self,
         region_id: RegionId,
         request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<RegionScannerRef> {
         let _timer = MITO_OPERATION_ELAPSED
             .with_label_values(&["read_physical"])
             .start_timer();
@@ -71,7 +69,7 @@ impl MetricEngineInner {
         &self,
         logical_region_id: RegionId,
         request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<RegionScannerRef> {
         let _timer = MITO_OPERATION_ELAPSED
             .with_label_values(&["read"])
             .start_timer();
@@ -158,7 +156,6 @@ impl MetricEngineInner {
     fn table_id_filter(&self, logical_region_id: RegionId) -> Expr {
         logical_expr::col(DATA_SCHEMA_TABLE_ID_COLUMN_NAME)
             .eq(logical_expr::lit(logical_region_id.table_id()))
-            .into()
     }
 
     /// Transform the projection from logical region to physical region.
@@ -256,6 +253,37 @@ impl MetricEngineInner {
 }
 
 #[cfg(test)]
+impl MetricEngineInner {
+    pub async fn scan_to_stream(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+    ) -> Result<common_recordbatch::SendableRecordBatchStream, common_error::ext::BoxedError> {
+        let is_reading_physical_region = self.is_physical_region(region_id);
+
+        if is_reading_physical_region {
+            self.mito
+                .scan_to_stream(region_id, request)
+                .await
+                .map_err(common_error::ext::BoxedError::new)
+        } else {
+            let physical_region_id = self
+                .get_physical_region_id(region_id)
+                .await
+                .map_err(common_error::ext::BoxedError::new)?;
+            let request = self
+                .transform_request(physical_region_id, region_id, request)
+                .await
+                .map_err(common_error::ext::BoxedError::new)?;
+            self.mito
+                .scan_to_stream(physical_region_id, request)
+                .await
+                .map_err(common_error::ext::BoxedError::new)
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use store_api::region_request::RegionRequest;
 
@@ -309,7 +337,6 @@ mod test {
             scan_req.filters[0],
             logical_expr::col(DATA_SCHEMA_TABLE_ID_COLUMN_NAME)
                 .eq(logical_expr::lit(logical_region_id.table_id()))
-                .into()
         );
 
         // check default projection

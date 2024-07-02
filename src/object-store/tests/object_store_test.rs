@@ -16,15 +16,16 @@ use std::env;
 use std::sync::Arc;
 
 use anyhow::Result;
-use common_telemetry::logging;
+use common_telemetry::info;
 use common_test_util::temp_dir::create_temp_dir;
 use object_store::layers::LruCacheLayer;
 use object_store::services::{Fs, S3};
 use object_store::test_util::TempFolder;
 use object_store::{ObjectStore, ObjectStoreBuilder};
-use opendal::raw::Accessor;
+use opendal::raw::oio::{List, Read};
+use opendal::raw::{Access, OpList, OpRead};
 use opendal::services::{Azblob, Gcs, Oss};
-use opendal::{EntryMode, Operator, OperatorBuilder};
+use opendal::{EntryMode, OperatorBuilder};
 
 async fn test_object_crud(store: &ObjectStore) -> Result<()> {
     // Create object handler.
@@ -36,11 +37,11 @@ async fn test_object_crud(store: &ObjectStore) -> Result<()> {
 
     // Read data from object;
     let bs = store.read(file_name).await?;
-    assert_eq!("Hello, World!", String::from_utf8(bs)?);
+    assert_eq!("Hello, World!", String::from_utf8(bs.to_vec())?);
 
     // Read range from object;
     let bs = store.read_with(file_name).range(1..=11).await?;
-    assert_eq!("ello, World", String::from_utf8(bs)?);
+    assert_eq!("ello, World", String::from_utf8(bs.to_vec())?);
 
     // Get object's Metadata
     let meta = store.stat(file_name).await?;
@@ -77,7 +78,7 @@ async fn test_object_list(store: &ObjectStore) -> Result<()> {
     assert_eq!(p2, entries.first().unwrap().path());
 
     let content = store.read(p2).await?;
-    assert_eq!("Hello, object2!", String::from_utf8(content)?);
+    assert_eq!("Hello, object2!", String::from_utf8(content.to_vec())?);
 
     store.delete(p2).await?;
     let entries = store.list("/").await?;
@@ -109,10 +110,10 @@ async fn test_fs_backend() -> Result<()> {
 
 #[tokio::test]
 async fn test_s3_backend() -> Result<()> {
-    logging::init_default_ut_logging();
+    common_telemetry::init_default_ut_logging();
     if let Ok(bucket) = env::var("GT_S3_BUCKET") {
         if !bucket.is_empty() {
-            logging::info!("Running s3 test.");
+            info!("Running s3 test.");
 
             let root = uuid::Uuid::new_v4().to_string();
 
@@ -138,10 +139,10 @@ async fn test_s3_backend() -> Result<()> {
 
 #[tokio::test]
 async fn test_oss_backend() -> Result<()> {
-    logging::init_default_ut_logging();
+    common_telemetry::init_default_ut_logging();
     if let Ok(bucket) = env::var("GT_OSS_BUCKET") {
         if !bucket.is_empty() {
-            logging::info!("Running oss test.");
+            info!("Running oss test.");
 
             let root = uuid::Uuid::new_v4().to_string();
 
@@ -166,10 +167,10 @@ async fn test_oss_backend() -> Result<()> {
 
 #[tokio::test]
 async fn test_azblob_backend() -> Result<()> {
-    logging::init_default_ut_logging();
+    common_telemetry::init_default_ut_logging();
     if let Ok(container) = env::var("GT_AZBLOB_CONTAINER") {
         if !container.is_empty() {
-            logging::info!("Running azblob test.");
+            info!("Running azblob test.");
 
             let root = uuid::Uuid::new_v4().to_string();
 
@@ -193,10 +194,10 @@ async fn test_azblob_backend() -> Result<()> {
 
 #[tokio::test]
 async fn test_gcs_backend() -> Result<()> {
-    logging::init_default_ut_logging();
+    common_telemetry::init_default_ut_logging();
     if let Ok(container) = env::var("GT_AZBLOB_CONTAINER") {
         if !container.is_empty() {
-            logging::info!("Running azblob test.");
+            info!("Running azblob test.");
 
             let mut builder = Gcs::default();
             builder
@@ -219,7 +220,7 @@ async fn test_gcs_backend() -> Result<()> {
 
 #[tokio::test]
 async fn test_file_backend_with_lru_cache() -> Result<()> {
-    logging::init_default_ut_logging();
+    common_telemetry::init_default_ut_logging();
 
     let data_dir = create_temp_dir("test_file_backend_with_lru_cache");
     let tmp_dir = create_temp_dir("test_file_backend_with_lru_cache");
@@ -228,7 +229,7 @@ async fn test_file_backend_with_lru_cache() -> Result<()> {
         .root(&data_dir.path().to_string_lossy())
         .atomic_write_dir(&tmp_dir.path().to_string_lossy());
 
-    let store = ObjectStore::new(builder).unwrap().finish();
+    let store = builder.build().unwrap();
 
     let cache_dir = create_temp_dir("test_file_backend_with_lru_cache");
     let cache_layer = {
@@ -238,12 +239,12 @@ async fn test_file_backend_with_lru_cache() -> Result<()> {
             .atomic_write_dir(&cache_dir.path().to_string_lossy());
         let file_cache = Arc::new(builder.build().unwrap());
 
-        LruCacheLayer::new(Arc::new(file_cache.clone()), 32)
-            .await
-            .unwrap()
+        LruCacheLayer::new(file_cache, 32).await.unwrap()
     };
 
-    let store = store.layer(cache_layer.clone());
+    let store = OperatorBuilder::new(store)
+        .layer(cache_layer.clone())
+        .finish();
 
     test_object_crud(&store).await?;
     test_object_list(&store).await?;
@@ -253,34 +254,36 @@ async fn test_file_backend_with_lru_cache() -> Result<()> {
     Ok(())
 }
 
-async fn assert_lru_cache<C: Accessor + Clone>(
-    cache_layer: &LruCacheLayer<C>,
-    file_names: &[&str],
-) {
+async fn assert_lru_cache<C: Access>(cache_layer: &LruCacheLayer<C>, file_names: &[&str]) {
     for file_name in file_names {
         assert!(cache_layer.contains_file(file_name).await);
     }
 }
 
-async fn assert_cache_files(
-    store: &Operator,
+async fn assert_cache_files<C: Access>(
+    store: &C,
     file_names: &[&str],
     file_contents: &[&str],
 ) -> Result<()> {
-    let objects = store.list("/").await?;
+    let (_, mut lister) = store.list("/", OpList::default()).await?;
+    let mut objects = vec![];
+    while let Some(e) = lister.next().await? {
+        objects.push(e);
+    }
 
     // compare the cache file with the expected cache file; ignore orders
     for o in objects {
-        let position = file_names.iter().position(|&x| x == o.name());
-        assert!(position.is_some(), "file not found: {}", o.name());
+        let position = file_names.iter().position(|&x| x == o.path());
+        assert!(position.is_some(), "file not found: {}", o.path());
 
         let position = position.unwrap();
-        let bs = store.read(o.path()).await.unwrap();
+        let (_, mut r) = store.read(o.path(), OpRead::default()).await.unwrap();
+        let bs = r.read_all().await.unwrap();
         assert_eq!(
             file_contents[position],
-            String::from_utf8(bs.clone())?,
+            String::from_utf8(bs.to_vec())?,
             "file content not match: {}",
-            o.name()
+            o.path()
         );
     }
 
@@ -309,12 +312,10 @@ async fn test_object_store_cache_policy() -> Result<()> {
         .root(&cache_dir.path().to_string_lossy())
         .atomic_write_dir(&atomic_temp_dir.path().to_string_lossy());
     let file_cache = Arc::new(builder.build().unwrap());
-    let cache_store = OperatorBuilder::new(file_cache.clone()).finish();
+    let cache_store = file_cache.clone();
 
     // create operator for cache dir to verify cache file
-    let cache_layer = LruCacheLayer::new(Arc::new(file_cache.clone()), 38)
-        .await
-        .unwrap();
+    let cache_layer = LruCacheLayer::new(cache_store.clone(), 38).await.unwrap();
     let store = store.layer(cache_layer.clone());
 
     // create several object handler.
@@ -386,7 +387,7 @@ async fn test_object_store_cache_policy() -> Result<()> {
     // instead of returning `NotFound` during the reader creation.
     // The entry count is 4, because we have the p2 `NotFound` cache.
     assert!(store.read_with(p2).range(0..4).await.is_err());
-    assert_eq!(cache_layer.read_cache_stat().await, (4, 35));
+    assert_eq!(cache_layer.read_cache_stat().await, (3, 35));
 
     assert_cache_files(
         &cache_store,
@@ -414,7 +415,7 @@ async fn test_object_store_cache_policy() -> Result<()> {
     assert!(store.read(p2).await.is_err());
     // Read p1 with range `1..` , the existing p1 with range `0..` must be evicted.
     let _ = store.read_with(p1).range(1..15).await.unwrap();
-    assert_eq!(cache_layer.read_cache_stat().await, (4, 34));
+    assert_eq!(cache_layer.read_cache_stat().await, (3, 34));
     assert_cache_files(
         &cache_store,
         &[
@@ -442,7 +443,7 @@ async fn test_object_store_cache_policy() -> Result<()> {
 
     drop(cache_layer);
     // Test recover
-    let cache_layer = LruCacheLayer::new(Arc::new(file_cache), 38).await.unwrap();
+    let cache_layer = LruCacheLayer::new(cache_store, 38).await.unwrap();
 
     // The p2 `NotFound` cache will not be recovered
     assert_eq!(cache_layer.read_cache_stat().await, (3, 34));

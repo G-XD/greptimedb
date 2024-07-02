@@ -15,24 +15,29 @@
 use std::sync::Arc;
 
 use api::region::RegionResponse;
-use api::v1::region::{QueryRequest, RegionRequest};
+use api::v1::flow::{FlowRequest, FlowResponse};
+use api::v1::region::{InsertRequests, RegionRequest};
 pub use common_base::AffectedRows;
+use common_query::request::QueryRequest;
 use common_recordbatch::SendableRecordBatchStream;
 
 use crate::cache_invalidator::DummyCacheInvalidator;
 use crate::ddl::flow_meta::FlowMetadataAllocator;
 use crate::ddl::table_meta::TableMetadataAllocator;
-use crate::ddl::DdlContext;
+use crate::ddl::{DdlContext, NoopRegionFailureDetectorControl};
 use crate::error::Result;
 use crate::key::flow::FlowMetadataManager;
 use crate::key::TableMetadataManager;
 use crate::kv_backend::memory::MemoryKvBackend;
 use crate::kv_backend::KvBackendRef;
-use crate::node_manager::{Datanode, DatanodeRef, FlownodeRef, NodeManager, NodeManagerRef};
-use crate::peer::Peer;
+use crate::node_manager::{
+    Datanode, DatanodeRef, Flownode, FlownodeRef, NodeManager, NodeManagerRef,
+};
+use crate::peer::{Peer, PeerLookupService, StandalonePeerLookupService};
 use crate::region_keeper::MemoryRegionKeeper;
 use crate::sequence::SequenceBuilder;
 use crate::wal_options_allocator::WalOptionsAllocator;
+use crate::{ClusterId, DatanodeId, FlownodeId};
 
 #[async_trait::async_trait]
 pub trait MockDatanodeHandler: Sync + Send + Clone {
@@ -45,7 +50,22 @@ pub trait MockDatanodeHandler: Sync + Send + Clone {
     ) -> Result<SendableRecordBatchStream>;
 }
 
-/// A mock struct implements [DatanodeManager].
+#[async_trait::async_trait]
+pub trait MockFlownodeHandler: Sync + Send + Clone {
+    async fn handle(&self, _peer: &Peer, _request: FlowRequest) -> Result<FlowResponse> {
+        unimplemented!()
+    }
+
+    async fn handle_inserts(
+        &self,
+        _peer: &Peer,
+        _requests: InsertRequests,
+    ) -> Result<FlowResponse> {
+        unimplemented!()
+    }
+}
+
+/// A mock struct implements [NodeManager] only implement the `datanode` method.
 #[derive(Clone)]
 pub struct MockDatanodeManager<T> {
     handler: T,
@@ -57,15 +77,27 @@ impl<T> MockDatanodeManager<T> {
     }
 }
 
+/// A mock struct implements [NodeManager] only implement the `flownode` method.
+#[derive(Clone)]
+pub struct MockFlownodeManager<T> {
+    handler: T,
+}
+
+impl<T> MockFlownodeManager<T> {
+    pub fn new(handler: T) -> Self {
+        Self { handler }
+    }
+}
+
 /// A mock struct implements [Datanode].
 #[derive(Clone)]
-struct MockDatanode<T> {
+struct MockNode<T> {
     peer: Peer,
     handler: T,
 }
 
 #[async_trait::async_trait]
-impl<T: MockDatanodeHandler> Datanode for MockDatanode<T> {
+impl<T: MockDatanodeHandler> Datanode for MockNode<T> {
     async fn handle(&self, request: RegionRequest) -> Result<RegionResponse> {
         self.handler.handle(&self.peer, request).await
     }
@@ -78,7 +110,7 @@ impl<T: MockDatanodeHandler> Datanode for MockDatanode<T> {
 #[async_trait::async_trait]
 impl<T: MockDatanodeHandler + 'static> NodeManager for MockDatanodeManager<T> {
     async fn datanode(&self, peer: &Peer) -> DatanodeRef {
-        Arc::new(MockDatanode {
+        Arc::new(MockNode {
             peer: peer.clone(),
             handler: self.handler.clone(),
         })
@@ -86,6 +118,31 @@ impl<T: MockDatanodeHandler + 'static> NodeManager for MockDatanodeManager<T> {
 
     async fn flownode(&self, _node: &Peer) -> FlownodeRef {
         unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: MockFlownodeHandler> Flownode for MockNode<T> {
+    async fn handle(&self, request: FlowRequest) -> Result<FlowResponse> {
+        self.handler.handle(&self.peer, request).await
+    }
+
+    async fn handle_inserts(&self, requests: InsertRequests) -> Result<FlowResponse> {
+        self.handler.handle_inserts(&self.peer, requests).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: MockFlownodeHandler + 'static> NodeManager for MockFlownodeManager<T> {
+    async fn datanode(&self, _peer: &Peer) -> DatanodeRef {
+        unimplemented!()
+    }
+
+    async fn flownode(&self, peer: &Peer) -> FlownodeRef {
+        Arc::new(MockNode {
+            peer: peer.clone(),
+            handler: self.handler.clone(),
+        })
     }
 }
 
@@ -124,5 +181,20 @@ pub fn new_ddl_context_with_kv_backend(
         table_metadata_manager,
         flow_metadata_allocator,
         flow_metadata_manager,
+        peer_lookup_service: Arc::new(StandalonePeerLookupService::new()),
+        region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
+    }
+}
+
+pub struct NoopPeerLookupService;
+
+#[async_trait::async_trait]
+impl PeerLookupService for NoopPeerLookupService {
+    async fn datanode(&self, _cluster_id: ClusterId, id: DatanodeId) -> Result<Option<Peer>> {
+        Ok(Some(Peer::empty(id)))
+    }
+
+    async fn flownode(&self, _cluster_id: ClusterId, id: FlownodeId) -> Result<Option<Peer>> {
+        Ok(Some(Peer::empty(id)))
     }
 }

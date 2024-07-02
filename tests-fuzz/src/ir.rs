@@ -20,6 +20,9 @@ pub(crate) mod insert_expr;
 pub(crate) mod select_expr;
 
 use core::fmt;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 pub use alter_expr::AlterTableExpr;
 use common_time::{Date, DateTime, Timestamp};
@@ -34,7 +37,9 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::generator::Random;
+use self::insert_expr::{RowValue, RowValues};
+use crate::context::TableContextRef;
+use crate::generator::{Random, TsValueGenerator};
 use crate::impl_random;
 use crate::ir::create_expr::ColumnOption;
 
@@ -65,10 +70,21 @@ lazy_static! {
     ];
     pub static ref STRING_DATA_TYPES: Vec<ConcreteDataType> =
         vec![ConcreteDataType::string_datatype()];
+    pub static ref MYSQL_TS_DATA_TYPES: Vec<ConcreteDataType> = vec![
+        // MySQL only permits fractional seconds with up to microseconds (6 digits) precision.
+        ConcreteDataType::timestamp_microsecond_datatype(),
+        ConcreteDataType::timestamp_millisecond_datatype(),
+        ConcreteDataType::timestamp_second_datatype(),
+    ];
 }
 
 impl_random!(ConcreteDataType, ColumnTypeGenerator, DATA_TYPES);
 impl_random!(ConcreteDataType, TsColumnTypeGenerator, TS_DATA_TYPES);
+impl_random!(
+    ConcreteDataType,
+    MySQLTsColumnTypeGenerator,
+    MYSQL_TS_DATA_TYPES
+);
 impl_random!(
     ConcreteDataType,
     PartibleColumnTypeGenerator,
@@ -82,6 +98,7 @@ impl_random!(
 
 pub struct ColumnTypeGenerator;
 pub struct TsColumnTypeGenerator;
+pub struct MySQLTsColumnTypeGenerator;
 pub struct PartibleColumnTypeGenerator;
 pub struct StringColumnTypeGenerator;
 
@@ -104,13 +121,29 @@ pub fn generate_random_value<R: Rng>(
         },
         ConcreteDataType::Date(_) => generate_random_date(rng),
         ConcreteDataType::DateTime(_) => generate_random_datetime(rng),
-        &ConcreteDataType::Timestamp(ts_type) => generate_random_timestamp(rng, ts_type),
 
         _ => unimplemented!("unsupported type: {datatype}"),
     }
 }
 
-fn generate_random_timestamp<R: Rng>(rng: &mut R, ts_type: TimestampType) -> Value {
+/// Generate monotonically increasing timestamps for MySQL.
+pub fn generate_unique_timestamp_for_mysql<R: Rng>(base: i64) -> TsValueGenerator<R> {
+    let base = Arc::new(AtomicI64::new(base));
+
+    Box::new(move |_rng, ts_type| -> Value {
+        let value = base.fetch_add(1, Ordering::Relaxed);
+        let v = match ts_type {
+            TimestampType::Second(_) => Timestamp::new_second(1 + value),
+            TimestampType::Millisecond(_) => Timestamp::new_millisecond(1000 + value),
+            TimestampType::Microsecond(_) => Timestamp::new_microsecond(1_000_000 + value),
+            TimestampType::Nanosecond(_) => Timestamp::new_nanosecond(1_000_000_000 + value),
+        };
+        Value::from(v)
+    })
+}
+
+/// Generate random timestamps.
+pub fn generate_random_timestamp<R: Rng>(rng: &mut R, ts_type: TimestampType) -> Value {
     let v = match ts_type {
         TimestampType::Second(_) => {
             let min = i64::from(Timestamp::MIN_SECOND);
@@ -133,6 +166,37 @@ fn generate_random_timestamp<R: Rng>(rng: &mut R, ts_type: TimestampType) -> Val
         TimestampType::Nanosecond(_) => {
             let min = i64::from(Timestamp::MIN_NANOSECOND);
             let max = i64::from(Timestamp::MAX_NANOSECOND);
+            let value = rng.gen_range(min..=max);
+            Timestamp::new_nanosecond(value)
+        }
+    };
+    Value::from(v)
+}
+
+// MySQL supports timestamp from '1970-01-01 00:00:01.000000' to '2038-01-19 03:14:07.499999'
+pub fn generate_random_timestamp_for_mysql<R: Rng>(rng: &mut R, ts_type: TimestampType) -> Value {
+    let v = match ts_type {
+        TimestampType::Second(_) => {
+            let min = 1;
+            let max = 2_147_483_647;
+            let value = rng.gen_range(min..=max);
+            Timestamp::new_second(value)
+        }
+        TimestampType::Millisecond(_) => {
+            let min = 1000;
+            let max = 2_147_483_647_499;
+            let value = rng.gen_range(min..=max);
+            Timestamp::new_millisecond(value)
+        }
+        TimestampType::Microsecond(_) => {
+            let min = 1_000_000;
+            let max = 2_147_483_647_499_999;
+            let value = rng.gen_range(min..=max);
+            Timestamp::new_microsecond(value)
+        }
+        TimestampType::Nanosecond(_) => {
+            let min = 1_000_000_000;
+            let max = 2_147_483_647_499_999_000;
             let value = rng.gen_range(min..=max);
             Timestamp::new_nanosecond(value)
         }
@@ -187,6 +251,10 @@ impl Ident {
             quote_style: Some(quote),
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
 }
 
 impl From<&str> for Ident {
@@ -227,6 +295,15 @@ pub struct Column {
 }
 
 impl Column {
+    /// Returns [TimestampType] if it's [ColumnOption::TimeIndex] [Column].
+    pub fn timestamp_type(&self) -> Option<TimestampType> {
+        if let ConcreteDataType::Timestamp(ts_type) = self.column_type {
+            Some(ts_type)
+        } else {
+            None
+        }
+    }
+
     /// Returns true if it's [ColumnOption::TimeIndex] [Column].
     pub fn is_time_index(&self) -> bool {
         self.options
@@ -258,6 +335,14 @@ impl Column {
             )
         })
     }
+
+    // Returns default value if it has.
+    pub fn default_value(&self) -> Option<&Value> {
+        self.options.iter().find_map(|opt| match opt {
+            ColumnOption::DefaultValue(value) => Some(value),
+            _ => None,
+        })
+    }
 }
 
 /// Returns droppable columns. i.e., non-primary key columns, non-ts columns.
@@ -267,6 +352,20 @@ pub fn droppable_columns(columns: &[Column]) -> Vec<&Column> {
         .filter(|column| {
             !column.options.iter().any(|option| {
                 option == &ColumnOption::PrimaryKey || option == &ColumnOption::TimeIndex
+            })
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Returns columns that can use the alter table modify command
+pub fn modifiable_columns(columns: &[Column]) -> Vec<&Column> {
+    columns
+        .iter()
+        .filter(|column| {
+            !column.options.iter().any(|option| {
+                option == &ColumnOption::PrimaryKey
+                    || option == &ColumnOption::TimeIndex
+                    || option == &ColumnOption::NotNull
             })
         })
         .collect::<Vec<_>>()
@@ -359,6 +458,42 @@ pub fn generate_columns<R: Rng + 'static>(
             }
         })
         .collect()
+}
+
+/// Replace Value::Default with the corresponding default value in the rows for comparison.
+pub fn replace_default(
+    rows: &[RowValues],
+    table_ctx_ref: &TableContextRef,
+    insert_expr: &InsertIntoExpr,
+) -> Vec<RowValues> {
+    let index_map: HashMap<usize, usize> = insert_expr
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(insert_idx, insert_column)| {
+            let create_idx = table_ctx_ref
+                .columns
+                .iter()
+                .position(|create_column| create_column.name == insert_column.name)
+                .expect("Column not found in create_expr");
+            (insert_idx, create_idx)
+        })
+        .collect();
+
+    let mut new_rows = Vec::new();
+    for row in rows {
+        let mut new_row = Vec::new();
+        for (idx, value) in row.iter().enumerate() {
+            if let RowValue::Default = value {
+                let column = &table_ctx_ref.columns[index_map[&idx]];
+                new_row.push(RowValue::Value(column.default_value().unwrap().clone()));
+            } else {
+                new_row.push(value.clone());
+            }
+        }
+        new_rows.push(new_row);
+    }
+    new_rows
 }
 
 #[cfg(test)]

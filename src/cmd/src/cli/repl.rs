@@ -16,34 +16,39 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use catalog::kvbackend::{
-    CachedMetaKvBackend, CachedMetaKvBackendBuilder, KvBackendCatalogManager,
+use cache::{
+    build_fundamental_cache_registry, with_default_composite_cache_registry, TABLE_CACHE_NAME,
+    TABLE_ROUTE_CACHE_NAME,
 };
-use client::{Client, OutputData, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use catalog::kvbackend::{
+    CachedMetaKvBackend, CachedMetaKvBackendBuilder, KvBackendCatalogManager, MetaKvBackend,
+};
+use client::{Client, Database, OutputData, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_base::Plugins;
 use common_config::Mode;
 use common_error::ext::ErrorExt;
-use common_meta::cache_invalidator::MultiCacheInvalidator;
+use common_meta::cache::{CacheRegistryBuilder, LayeredCacheRegistryBuilder};
 use common_query::Output;
 use common_recordbatch::RecordBatches;
-use common_telemetry::logging;
+use common_telemetry::debug;
 use either::Either;
 use meta_client::client::MetaClientBuilder;
 use query::datafusion::DatafusionQueryEngine;
 use query::logical_optimizer::LogicalOptimizer;
 use query::parser::QueryLanguageParser;
 use query::plan::LogicalPlan;
-use query::query_engine::QueryEngineState;
+use query::query_engine::{DefaultSerializer, QueryEngineState};
 use query::QueryEngine;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use session::context::QueryContext;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 
 use crate::cli::cmd::ReplCommand;
 use crate::cli::helper::RustylineHelper;
 use crate::cli::AttachCommand;
+use crate::error;
 use crate::error::{
     CollectRecordBatchesSnafu, ParseSqlSnafu, PlanStatementSnafu, PrettyPrintRecordBatchesSnafu,
     ReadlineSnafu, ReplCreationSnafu, RequestDatabaseSnafu, Result, StartMetaClientSnafu,
@@ -78,7 +83,7 @@ impl Repl {
 
             let history_file = history_file();
             if let Err(e) = rl.load_history(&history_file) {
-                logging::debug!(
+                debug!(
                     "failed to load history file on {}, error: {e}",
                     history_file.display()
                 );
@@ -161,7 +166,10 @@ impl Repl {
         let start = Instant::now();
 
         let output = if let Some(query_engine) = &self.query_engine {
-            let query_ctx = QueryContext::with(self.database.catalog(), self.database.schema());
+            let query_ctx = Arc::new(QueryContext::with(
+                self.database.catalog(),
+                self.database.schema(),
+            ));
 
             let stmt = QueryLanguageParser::parse_sql(&sql, &query_ctx)
                 .with_context(|_| ParseSqlSnafu { sql: sql.clone() })?;
@@ -177,7 +185,7 @@ impl Repl {
                 .context(PlanStatementSnafu)?;
 
             let plan = DFLogicalSubstraitConvertor {}
-                .encode(&plan)
+                .encode(&plan, DefaultSerializer)
                 .context(SubstraitEncodeLogicalPlanSnafu)?;
 
             self.database.logical_plan(plan.to_vec()).await
@@ -225,7 +233,7 @@ impl Drop for Repl {
         if self.rl.helper().is_some() {
             let history_file = history_file();
             if let Err(e) = self.rl.save_history(&history_file) {
-                logging::debug!(
+                debug!(
                     "failed to save history file on {}, error: {e}",
                     history_file.display()
                 );
@@ -254,19 +262,30 @@ async fn create_query_engine(meta_addr: &str) -> Result<DatafusionQueryEngine> {
 
     let cached_meta_backend =
         Arc::new(CachedMetaKvBackendBuilder::new(meta_client.clone()).build());
-    let multi_cache_invalidator = Arc::new(MultiCacheInvalidator::with_invalidators(vec![
-        cached_meta_backend.clone(),
-    ]));
-    let catalog_list = KvBackendCatalogManager::new(
+    let layered_cache_builder = LayeredCacheRegistryBuilder::default().add_cache_registry(
+        CacheRegistryBuilder::default()
+            .add_cache(cached_meta_backend.clone())
+            .build(),
+    );
+    let fundamental_cache_registry =
+        build_fundamental_cache_registry(Arc::new(MetaKvBackend::new(meta_client.clone())));
+    let layered_cache_registry = Arc::new(
+        with_default_composite_cache_registry(
+            layered_cache_builder.add_cache_registry(fundamental_cache_registry),
+        )
+        .context(error::BuildCacheRegistrySnafu)?
+        .build(),
+    );
+
+    let catalog_manager = KvBackendCatalogManager::new(
         Mode::Distributed,
         Some(meta_client.clone()),
         cached_meta_backend.clone(),
-        multi_cache_invalidator,
-    )
-    .await;
+        layered_cache_registry,
+    );
     let plugins: Plugins = Default::default();
     let state = Arc::new(QueryEngineState::new(
-        catalog_list,
+        catalog_manager,
         None,
         None,
         None,

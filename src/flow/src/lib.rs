@@ -17,16 +17,23 @@
 //! It also contains definition of expression, adapter and plan, and internal state management.
 
 #![feature(let_chains)]
+#![feature(duration_abs_diff)]
 #![allow(dead_code)]
 #![allow(unused_imports)]
-#![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 #![warn(clippy::too_many_lines)]
 // allow unused for now because it should be use later
 mod adapter;
 mod compute;
+mod error;
 mod expr;
+pub mod heartbeat;
 mod plan;
 mod repr;
+mod server;
 mod transform;
 mod utils;
+
+pub use adapter::{FlowWorkerManager, FlowWorkerManagerRef, FlownodeOptions};
+pub use error::{Error, Result};
+pub use server::{FlownodeBuilder, FlownodeInstance, FlownodeServer};

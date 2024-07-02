@@ -20,7 +20,7 @@ use client::{Output, OutputData, OutputMeta};
 use common_base::readable_size::ReadableSize;
 use common_datasource::file_format::csv::{CsvConfigBuilder, CsvFormat, CsvOpener};
 use common_datasource::file_format::json::{JsonFormat, JsonOpener};
-use common_datasource::file_format::orc::{infer_orc_schema, new_orc_stream_reader};
+use common_datasource::file_format::orc::{infer_orc_schema, new_orc_stream_reader, ReaderAdapter};
 use common_datasource::file_format::{FileFormat, Format};
 use common_datasource::lister::{Lister, Source};
 use common_datasource::object_store::{build_backend, parse_url};
@@ -46,6 +46,7 @@ use session::context::QueryContextRef;
 use snafu::ResultExt;
 use table::requests::{CopyTableRequest, InsertRequest};
 use table::table_reference::TableReference;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::error::{self, IntoVectorsSnafu, Result};
 use crate::statement::StatementExecutor;
@@ -146,10 +147,18 @@ impl StatementExecutor {
                 path,
             }),
             Format::Parquet(_) => {
+                let meta = object_store
+                    .stat(&path)
+                    .await
+                    .context(error::ReadObjectSnafu { path: &path })?;
                 let mut reader = object_store
                     .reader(&path)
                     .await
-                    .context(error::ReadObjectSnafu { path: &path })?;
+                    .context(error::ReadObjectSnafu { path: &path })?
+                    .into_futures_async_read(0..meta.content_length())
+                    .await
+                    .context(error::ReadObjectSnafu { path: &path })?
+                    .compat();
                 let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default())
                     .await
                     .context(error::ReadParquetMetadataSnafu)?;
@@ -161,12 +170,17 @@ impl StatementExecutor {
                 })
             }
             Format::Orc(_) => {
+                let meta = object_store
+                    .stat(&path)
+                    .await
+                    .context(error::ReadObjectSnafu { path: &path })?;
+
                 let reader = object_store
                     .reader(&path)
                     .await
                     .context(error::ReadObjectSnafu { path: &path })?;
 
-                let schema = infer_orc_schema(reader)
+                let schema = infer_orc_schema(ReaderAdapter::new(reader, meta.content_length()))
                     .await
                     .context(error::ReadOrcSnafu)?;
 
@@ -279,11 +293,19 @@ impl StatementExecutor {
                 )))
             }
             FileMetadata::Parquet { metadata, path, .. } => {
-                let reader = object_store
-                    .reader_with(path)
-                    .buffer(DEFAULT_READ_BUFFER)
+                let meta = object_store
+                    .stat(path)
                     .await
                     .context(error::ReadObjectSnafu { path })?;
+                let reader = object_store
+                    .reader_with(path)
+                    .chunk(DEFAULT_READ_BUFFER)
+                    .await
+                    .context(error::ReadObjectSnafu { path })?
+                    .into_futures_async_read(0..meta.content_length())
+                    .await
+                    .context(error::ReadObjectSnafu { path })?
+                    .compat();
                 let builder =
                     ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone());
                 let stream = builder
@@ -302,14 +324,20 @@ impl StatementExecutor {
                 )))
             }
             FileMetadata::Orc { path, .. } => {
-                let reader = object_store
-                    .reader_with(path)
-                    .buffer(DEFAULT_READ_BUFFER)
+                let meta = object_store
+                    .stat(path)
                     .await
                     .context(error::ReadObjectSnafu { path })?;
-                let stream = new_orc_stream_reader(reader)
+
+                let reader = object_store
+                    .reader_with(path)
+                    .chunk(DEFAULT_READ_BUFFER)
                     .await
-                    .context(error::ReadOrcSnafu)?;
+                    .context(error::ReadObjectSnafu { path })?;
+                let stream =
+                    new_orc_stream_reader(ReaderAdapter::new(reader, meta.content_length()))
+                        .await
+                        .context(error::ReadOrcSnafu)?;
 
                 let projected_schema = Arc::new(
                     compat_schema
@@ -377,6 +405,7 @@ impl StatementExecutor {
 
         let mut rows_inserted = 0;
         let mut insert_cost = 0;
+        let max_insert_rows = req.limit.map(|n| n as usize);
         for (compat_schema, file_schema_projection, projected_table_schema, file_metadata) in files
         {
             let mut stream = self
@@ -427,6 +456,12 @@ impl StatementExecutor {
                     rows_inserted += rows;
                     insert_cost += cost;
                 }
+
+                if let Some(max_insert_rows) = max_insert_rows {
+                    if rows_inserted >= max_insert_rows {
+                        return Ok(gen_insert_output(rows_inserted, insert_cost));
+                    }
+                }
             }
 
             if !pending.is_empty() {
@@ -436,11 +471,15 @@ impl StatementExecutor {
             }
         }
 
-        Ok(Output::new(
-            OutputData::AffectedRows(rows_inserted),
-            OutputMeta::new_with_cost(insert_cost),
-        ))
+        Ok(gen_insert_output(rows_inserted, insert_cost))
     }
+}
+
+fn gen_insert_output(rows_inserted: usize, insert_cost: usize) -> Output {
+    Output::new(
+        OutputData::AffectedRows(rows_inserted),
+        OutputMeta::new_with_cost(insert_cost),
+    )
 }
 
 /// Executes all pending inserts all at once, drain pending requests and reset pending bytes.

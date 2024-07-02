@@ -32,11 +32,15 @@ use tests_fuzz::fake::{
 use tests_fuzz::generator::create_expr::CreateTableExprGeneratorBuilder;
 use tests_fuzz::generator::insert_expr::InsertExprGeneratorBuilder;
 use tests_fuzz::generator::Generator;
-use tests_fuzz::ir::{CreateTableExpr, InsertIntoExpr};
+use tests_fuzz::ir::{
+    generate_random_timestamp_for_mysql, generate_random_value, replace_default, CreateTableExpr,
+    InsertIntoExpr, MySQLTsColumnTypeGenerator,
+};
 use tests_fuzz::translator::mysql::create_expr::CreateTableExprTranslator;
 use tests_fuzz::translator::mysql::insert_expr::InsertIntoExprTranslator;
 use tests_fuzz::translator::DslTranslator;
-use tests_fuzz::utils::{init_greptime_connections_via_env, Connections};
+use tests_fuzz::utils::{flush_memtable, init_greptime_connections_via_env, Connections};
+use tests_fuzz::validator;
 
 struct FuzzContext {
     greptime: Pool<MySql>,
@@ -80,6 +84,7 @@ fn generate_create_expr<R: Rng + 'static>(
         )))
         .columns(input.columns)
         .engine("mito")
+        .ts_column_type_generator(Box::new(MySQLTsColumnTypeGenerator))
         .build()
         .unwrap();
     create_table_generator.generate(rng)
@@ -96,6 +101,8 @@ fn generate_insert_expr<R: Rng + 'static>(
         .table_ctx(table_ctx)
         .omit_column_list(omit_column_list)
         .rows(input.rows)
+        .value_generator(Box::new(generate_random_value))
+        .ts_value_generator(Box::new(generate_random_timestamp_for_mysql))
         .build()
         .unwrap();
     insert_generator.generate(rng)
@@ -114,7 +121,7 @@ async fn execute_insert(ctx: FuzzContext, input: FuzzInput) -> Result<()> {
         .context(error::ExecuteQuerySnafu { sql: &sql })?;
 
     let table_ctx = Arc::new(TableContext::from(&create_expr));
-    let insert_expr = generate_insert_expr(input, &mut rng, table_ctx)?;
+    let insert_expr = generate_insert_expr(input, &mut rng, table_ctx.clone())?;
     let translator = InsertIntoExprTranslator;
     let sql = translator.translate(&insert_expr)?;
     let result = ctx
@@ -135,7 +142,66 @@ async fn execute_insert(ctx: FuzzContext, input: FuzzInput) -> Result<()> {
         }
     );
 
-    // TODO: Validate inserted rows
+    if rng.gen_bool(0.5) {
+        flush_memtable(&ctx.greptime, &create_expr.table_name).await?;
+    }
+
+    // Validate inserted rows
+    // The order of inserted rows are random, so we need to sort the inserted rows by primary keys and time index for comparison
+    let primary_keys_names = create_expr
+        .columns
+        .iter()
+        .filter(|c| c.is_primary_key() || c.is_time_index())
+        .map(|c| c.name.clone())
+        .collect::<Vec<_>>();
+
+    // Not all primary keys are in insert_expr
+    let primary_keys_idxs_in_insert_expr = insert_expr
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| primary_keys_names.contains(&c.name))
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let primary_keys_column_list = primary_keys_idxs_in_insert_expr
+        .iter()
+        .map(|&i| insert_expr.columns[i].name.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+        .to_string();
+
+    let column_list = insert_expr
+        .columns
+        .iter()
+        .map(|c| c.name.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+        .to_string();
+
+    let select_sql = format!(
+        "SELECT {} FROM {} ORDER BY {}",
+        column_list, create_expr.table_name, primary_keys_column_list
+    );
+    let fetched_rows = validator::row::fetch_values(&ctx.greptime, select_sql.as_str()).await?;
+    let mut expected_rows = replace_default(&insert_expr.values_list, &table_ctx, &insert_expr);
+    expected_rows.sort_by(|a, b| {
+        let a_keys: Vec<_> = primary_keys_idxs_in_insert_expr
+            .iter()
+            .map(|&i| &a[i])
+            .collect();
+        let b_keys: Vec<_> = primary_keys_idxs_in_insert_expr
+            .iter()
+            .map(|&i| &b[i])
+            .collect();
+        for (a_key, b_key) in a_keys.iter().zip(b_keys.iter()) {
+            match a_key.cmp(b_key) {
+                Some(std::cmp::Ordering::Equal) => continue,
+                non_eq => return non_eq.unwrap(),
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    validator::row::assert_eq::<MySql>(&insert_expr.columns, &fetched_rows, &expected_rows)?;
 
     // Cleans up
     let sql = format!("DROP TABLE {}", create_expr.table_name);

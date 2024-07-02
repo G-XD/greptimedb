@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use common_base::readable_size::ReadableSize;
 use common_base::Plugins;
+use common_config::Configurable;
 use common_greptimedb_telemetry::GreptimeDBTelemetryTask;
 use common_grpc::channel_manager;
 use common_meta::ddl::ProcedureExecutorRef;
@@ -31,7 +32,7 @@ use common_meta::wal_options_allocator::WalOptionsAllocatorRef;
 use common_meta::{distributed_time_constants, ClusterId};
 use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
-use common_telemetry::logging::LoggingOptions;
+use common_telemetry::logging::{LoggingOptions, TracingOptions};
 use common_telemetry::{error, info, warn};
 use common_wal::config::MetasrvWalConfig;
 use serde::{Deserialize, Serialize};
@@ -49,10 +50,11 @@ use crate::error::{
 };
 use crate::failure_detector::PhiAccrualFailureDetectorOptions;
 use crate::handler::HeartbeatHandlerGroup;
-use crate::lease::lookup_alive_datanode_peer;
+use crate::lease::lookup_datanode_peer;
 use crate::lock::DistLockRef;
 use crate::procedure::region_migration::manager::RegionMigrationManagerRef;
-use crate::pubsub::{PublishRef, SubscribeManagerRef};
+use crate::pubsub::{PublisherRef, SubscriptionManagerRef};
+use crate::region::supervisor::RegionSupervisorTickerRef;
 use crate::selector::{Selector, SelectorType};
 use crate::service::mailbox::MailboxRef;
 use crate::service::store::cached_kv::LeaderCachedKvBackend;
@@ -70,7 +72,7 @@ pub struct MetasrvOptions {
     /// The address the server advertises to the clients.
     pub server_addr: String,
     /// The address of the store, e.g., etcd.
-    pub store_addr: String,
+    pub store_addrs: Vec<String>,
     /// The type of selector.
     pub selector: SelectorType,
     /// Whether to use the memory store.
@@ -109,12 +111,8 @@ pub struct MetasrvOptions {
     /// limit the number of operations in a txn because an infinitely large txn could
     /// potentially block other operations.
     pub max_txn_ops: usize,
-}
-
-impl MetasrvOptions {
-    pub fn env_list_keys() -> Option<&'static [&'static str]> {
-        Some(&["wal.broker_endpoints"])
-    }
+    /// The tracing options.
+    pub tracing: TracingOptions,
 }
 
 impl Default for MetasrvOptions {
@@ -122,7 +120,7 @@ impl Default for MetasrvOptions {
         Self {
             bind_addr: "127.0.0.1:3002".to_string(),
             server_addr: "127.0.0.1:3002".to_string(),
-            store_addr: "127.0.0.1:2379".to_string(),
+            store_addrs: vec!["127.0.0.1:2379".to_string()],
             selector: SelectorType::default(),
             use_memory_store: false,
             enable_region_failover: false,
@@ -146,13 +144,14 @@ impl Default for MetasrvOptions {
             export_metrics: ExportMetricsOption::default(),
             store_key_prefix: String::new(),
             max_txn_ops: 128,
+            tracing: TracingOptions::default(),
         }
     }
 }
 
-impl MetasrvOptions {
-    pub fn to_toml_string(&self) -> String {
-        toml::to_string(&self).unwrap()
+impl Configurable for MetasrvOptions {
+    fn env_list_keys() -> Option<&'static [&'static str]> {
+        Some(&["wal.broker_endpoints"])
     }
 }
 
@@ -207,6 +206,7 @@ impl Context {
     }
 }
 
+/// The value of the leader. It is used to store the leader's address.
 pub struct LeaderValue(pub String);
 
 impl<T: AsRef<[u8]>> From<T> for LeaderValue {
@@ -216,10 +216,43 @@ impl<T: AsRef<[u8]>> From<T> for LeaderValue {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetasrvNodeInfo {
+    // The metasrv's address
+    pub addr: String,
+    // The node build version
+    pub version: String,
+    // The node build git commit hash
+    pub git_commit: String,
+    // The node start timestamp in milliseconds
+    pub start_time_ms: u64,
+}
+
+impl From<MetasrvNodeInfo> for api::v1::meta::MetasrvNodeInfo {
+    fn from(node_info: MetasrvNodeInfo) -> Self {
+        Self {
+            peer: Some(api::v1::meta::Peer {
+                addr: node_info.addr,
+                ..Default::default()
+            }),
+            version: node_info.version,
+            git_commit: node_info.git_commit,
+            start_time_ms: node_info.start_time_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum SelectTarget {
+    Datanode,
+    Flownode,
+}
+
 #[derive(Clone)]
 pub struct SelectorContext {
     pub server_addr: String,
     pub datanode_lease_secs: u64,
+    pub flownode_lease_secs: u64,
     pub kv_backend: KvBackendRef,
     pub meta_peer_client: MetaPeerClientRef,
     pub table_id: Option<TableId>,
@@ -231,9 +264,10 @@ pub type ElectionRef = Arc<dyn Election<Leader = LeaderValue>>;
 pub struct MetaStateHandler {
     procedure_manager: ProcedureManagerRef,
     wal_options_allocator: WalOptionsAllocatorRef,
-    subscribe_manager: Option<SubscribeManagerRef>,
+    subscribe_manager: Option<SubscriptionManagerRef>,
     greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
     leader_cached_kv_backend: Arc<LeaderCachedKvBackend>,
+    region_supervisor_ticker: Option<RegionSupervisorTickerRef>,
     state: StateRef,
 }
 
@@ -245,6 +279,10 @@ impl MetaStateHandler {
             error!(e; "Failed to load kv into leader cache kv store");
         } else {
             self.state.write().unwrap().next_state(become_leader(true));
+        }
+
+        if let Some(ticker) = self.region_supervisor_ticker.as_ref() {
+            ticker.start();
         }
 
         if let Err(e) = self.procedure_manager.start().await {
@@ -265,13 +303,19 @@ impl MetaStateHandler {
         if let Err(e) = self.procedure_manager.stop().await {
             error!(e; "Failed to stop procedure manager");
         }
+
+        if let Some(ticker) = self.region_supervisor_ticker.as_ref() {
+            // Stops the supervisor ticker.
+            ticker.stop();
+        }
+
         // Suspends reporting.
         self.greptimedb_telemetry_task.should_report(false);
 
         if let Some(sub_manager) = self.subscribe_manager.clone() {
             info!("Leader changed, un_subscribe all");
-            if let Err(e) = sub_manager.un_subscribe_all() {
-                error!("Failed to un_subscribe all, error: {}", e);
+            if let Err(e) = sub_manager.unsubscribe_all() {
+                error!(e; "Failed to un_subscribe all");
             }
         }
     }
@@ -281,6 +325,7 @@ impl MetaStateHandler {
 pub struct Metasrv {
     state: StateRef,
     started: Arc<AtomicBool>,
+    start_time_ms: u64,
     options: MetasrvOptions,
     // It is only valid at the leader node and is used to temporarily
     // store some data that will not be persisted.
@@ -288,7 +333,10 @@ pub struct Metasrv {
     kv_backend: KvBackendRef,
     leader_cached_kv_backend: Arc<LeaderCachedKvBackend>,
     meta_peer_client: MetaPeerClientRef,
+    // The selector is used to select a target datanode.
     selector: SelectorRef,
+    // The flow selector is used to select a target flownode.
+    flow_selector: SelectorRef,
     handler_group: HeartbeatHandlerGroup,
     election: Option<ElectionRef>,
     lock: DistLockRef,
@@ -300,6 +348,7 @@ pub struct Metasrv {
     memory_region_keeper: MemoryRegionKeeperRef,
     greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
     region_migration_manager: RegionMigrationManagerRef,
+    region_supervisor_ticker: Option<RegionSupervisorTickerRef>,
 
     plugins: Plugins,
 }
@@ -315,18 +364,23 @@ impl Metasrv {
             return Ok(());
         }
 
-        self.create_default_schema_if_not_exist().await?;
+        // Creates default schema if not exists
+        self.table_metadata_manager
+            .init()
+            .await
+            .context(InitMetadataSnafu)?;
 
         if let Some(election) = self.election() {
             let procedure_manager = self.procedure_manager.clone();
             let in_memory = self.in_memory.clone();
             let leader_cached_kv_backend = self.leader_cached_kv_backend.clone();
-            let subscribe_manager = self.subscribe_manager();
+            let subscribe_manager = self.subscription_manager();
             let mut rx = election.subscribe_leader_change();
             let greptimedb_telemetry_task = self.greptimedb_telemetry_task.clone();
             greptimedb_telemetry_task
                 .start()
                 .context(StartTelemetryTaskSnafu)?;
+            let region_supervisor_ticker = self.region_supervisor_ticker.clone();
             let state_handler = MetaStateHandler {
                 greptimedb_telemetry_task,
                 subscribe_manager,
@@ -334,6 +388,7 @@ impl Metasrv {
                 wal_options_allocator: self.wal_options_allocator.clone(),
                 state: self.state.clone(),
                 leader_cached_kv_backend: leader_cached_kv_backend.clone(),
+                region_supervisor_ticker,
             };
             let _handle = common_runtime::spawn_bg(async move {
                 loop {
@@ -370,11 +425,12 @@ impl Metasrv {
             {
                 let election = election.clone();
                 let started = self.started.clone();
+                let node_info = self.node_info();
                 let _handle = common_runtime::spawn_bg(async move {
                     while started.load(Ordering::Relaxed) {
-                        let res = election.register_candidate().await;
+                        let res = election.register_candidate(&node_info).await;
                         if let Err(e) = res {
-                            warn!("Metasrv register candidate error: {}", e);
+                            warn!(e; "Metasrv register candidate error");
                         }
                     }
                 });
@@ -388,7 +444,7 @@ impl Metasrv {
                     while started.load(Ordering::Relaxed) {
                         let res = election.campaign().await;
                         if let Err(e) = res {
-                            warn!("Metasrv election error: {}", e);
+                            warn!(e; "Metasrv election error");
                         }
                         info!("Metasrv re-initiate election");
                     }
@@ -411,14 +467,8 @@ impl Metasrv {
         }
 
         info!("Metasrv started");
-        Ok(())
-    }
 
-    async fn create_default_schema_if_not_exist(&self) -> Result<()> {
-        self.table_metadata_manager
-            .init()
-            .await
-            .context(InitMetadataSnafu)
+        Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -429,13 +479,27 @@ impl Metasrv {
             .context(StopProcedureManagerSnafu)
     }
 
+    pub fn start_time_ms(&self) -> u64 {
+        self.start_time_ms
+    }
+
+    pub fn node_info(&self) -> MetasrvNodeInfo {
+        let build_info = common_version::build_info();
+        MetasrvNodeInfo {
+            addr: self.options().server_addr.clone(),
+            version: build_info.version.to_string(),
+            git_commit: build_info.commit_short.to_string(),
+            start_time_ms: self.start_time_ms(),
+        }
+    }
+
     /// Lookup a peer by peer_id, return it only when it's alive.
     pub(crate) async fn lookup_peer(
         &self,
         cluster_id: ClusterId,
         peer_id: u64,
     ) -> Result<Option<Peer>> {
-        lookup_alive_datanode_peer(
+        lookup_datanode_peer(
             cluster_id,
             peer_id,
             &self.meta_peer_client,
@@ -444,7 +508,6 @@ impl Metasrv {
         .await
     }
 
-    #[inline]
     pub fn options(&self) -> &MetasrvOptions {
         &self.options
     }
@@ -463,6 +526,10 @@ impl Metasrv {
 
     pub fn selector(&self) -> &SelectorRef {
         &self.selector
+    }
+
+    pub fn flow_selector(&self) -> &SelectorRef {
+        &self.flow_selector
     }
 
     pub fn handler_group(&self) -> &HeartbeatHandlerGroup {
@@ -501,12 +568,12 @@ impl Metasrv {
         &self.region_migration_manager
     }
 
-    pub fn publish(&self) -> Option<PublishRef> {
-        self.plugins.get::<PublishRef>()
+    pub fn publish(&self) -> Option<PublisherRef> {
+        self.plugins.get::<PublisherRef>()
     }
 
-    pub fn subscribe_manager(&self) -> Option<SubscribeManagerRef> {
-        self.plugins.get::<SubscribeManagerRef>()
+    pub fn subscription_manager(&self) -> Option<SubscriptionManagerRef> {
+        self.plugins.get::<SubscriptionManagerRef>()
     }
 
     pub fn plugins(&self) -> &Plugins {

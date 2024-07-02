@@ -15,13 +15,14 @@
 use std::sync::Arc;
 
 use api::region::RegionResponse;
-use api::v1::region::{QueryRequest, RegionRequest, RegionResponse as RegionResponseV1};
+use api::v1::region::{RegionRequest, RegionResponse as RegionResponseV1};
 use async_trait::async_trait;
 use client::region::check_response_header;
 use common_error::ext::BoxedError;
 use common_meta::error::{self as meta_error, Result as MetaResult};
 use common_meta::node_manager::{Datanode, DatanodeRef, FlownodeRef, NodeManager};
 use common_meta::peer::Peer;
+use common_query::request::QueryRequest;
 use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::tracing;
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
@@ -31,16 +32,19 @@ use snafu::{OptionExt, ResultExt};
 
 use crate::error::{InvalidRegionRequestSnafu, InvokeRegionServerSnafu, Result};
 
-pub struct StandaloneDatanodeManager(pub RegionServer);
+pub struct StandaloneDatanodeManager {
+    pub region_server: RegionServer,
+    pub flow_server: FlownodeRef,
+}
 
 #[async_trait]
 impl NodeManager for StandaloneDatanodeManager {
     async fn datanode(&self, _datanode: &Peer) -> DatanodeRef {
-        RegionInvoker::arc(self.0.clone())
+        RegionInvoker::arc(self.region_server.clone())
     }
 
     async fn flownode(&self, _node: &Peer) -> FlownodeRef {
-        unimplemented!()
+        self.flow_server.clone()
     }
 }
 

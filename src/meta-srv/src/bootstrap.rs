@@ -20,6 +20,7 @@ use api::v1::meta::lock_server::LockServer;
 use api::v1::meta::procedure_service_server::ProcedureServiceServer;
 use api::v1::meta::store_server::StoreServer;
 use common_base::Plugins;
+use common_config::Configurable;
 use common_meta::kv_backend::chroot::ChrootKvBackend;
 use common_meta::kv_backend::etcd::EtcdStore;
 use common_meta::kv_backend::memory::MemoryKvBackend;
@@ -38,13 +39,14 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tonic::transport::server::{Router, TcpIncoming};
 
 use crate::election::etcd::EtcdElection;
-use crate::error::InitExportMetricsTaskSnafu;
+use crate::error::{InitExportMetricsTaskSnafu, TomlFormatSnafu};
 use crate::lock::etcd::EtcdLock;
 use crate::lock::memory::MemLock;
 use crate::metasrv::builder::MetasrvBuilder;
 use crate::metasrv::{Metasrv, MetasrvOptions, SelectorRef};
 use crate::selector::lease_based::LeaseBasedSelector;
 use crate::selector::load_based::LoadBasedSelector;
+use crate::selector::round_robin::RoundRobinSelector;
 use crate::selector::SelectorType;
 use crate::service::admin;
 use crate::{error, Result};
@@ -73,7 +75,7 @@ impl MetasrvInstance {
         let httpsrv = Arc::new(
             HttpServerBuilder::new(opts.http.clone())
                 .with_metrics_handler(MetricsHandler)
-                .with_greptime_config_options(opts.to_toml_string())
+                .with_greptime_config_options(opts.to_toml().context(TomlFormatSnafu)?)
                 .build(),
         );
         // put metasrv into plugins for later use
@@ -227,6 +229,7 @@ pub async fn metasrv_builder(
     let selector = match opts.selector {
         SelectorType::LoadBased => Arc::new(LoadBasedSelector::default()) as SelectorRef,
         SelectorType::LeaseBased => Arc::new(LeaseBasedSelector) as SelectorRef,
+        SelectorType::RoundRobin => Arc::new(RoundRobinSelector::default()) as SelectorRef,
     };
 
     Ok(MetasrvBuilder::new()
@@ -241,8 +244,8 @@ pub async fn metasrv_builder(
 
 async fn create_etcd_client(opts: &MetasrvOptions) -> Result<Client> {
     let etcd_endpoints = opts
-        .store_addr
-        .split(',')
+        .store_addrs
+        .iter()
         .map(|x| x.trim())
         .filter(|x| !x.is_empty())
         .collect::<Vec<_>>();

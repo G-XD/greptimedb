@@ -17,14 +17,14 @@ use std::sync::Arc;
 
 use auth::UserProviderRef;
 use common_base::Plugins;
+use common_config::{Configurable, Mode};
 use common_runtime::Builder as RuntimeBuilder;
 use servers::grpc::builder::GrpcServerBuilder;
 use servers::grpc::greptime_handler::GreptimeRequestHandler;
-use servers::grpc::{GrpcServer, GrpcServerConfig};
+use servers::grpc::{GrpcOptions, GrpcServer, GrpcServerConfig};
 use servers::http::{HttpServer, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
-use servers::opentsdb::OpentsdbServer;
 use servers::postgres::PostgresServer;
 use servers::query_handler::grpc::ServerGrpcQueryHandlerAdapter;
 use servers::query_handler::sql::ServerSqlQueryHandlerAdapter;
@@ -32,14 +32,13 @@ use servers::server::{Server, ServerHandlers};
 use servers::tls::{maybe_watch_tls_config, ReloadableTlsServerConfig};
 use snafu::ResultExt;
 
-use crate::error::{self, Result, StartServerSnafu};
-use crate::frontend::{FrontendOptions, TomlSerializable};
+use crate::error::{self, Result, StartServerSnafu, TomlFormatSnafu};
+use crate::frontend::FrontendOptions;
 use crate::instance::FrontendInstance;
-use crate::service_config::GrpcOptions;
 
 pub struct Services<T, U>
 where
-    T: Into<FrontendOptions> + TomlSerializable + Clone,
+    T: Into<FrontendOptions> + Configurable + Clone,
     U: FrontendInstance,
 {
     opts: T,
@@ -51,7 +50,7 @@ where
 
 impl<T, U> Services<T, U>
 where
-    T: Into<FrontendOptions> + TomlSerializable + Clone,
+    T: Into<FrontendOptions> + Configurable + Clone,
     U: FrontendInstance,
 {
     pub fn new(opts: T, instance: Arc<U>, plugins: Plugins) -> Self {
@@ -76,9 +75,12 @@ where
         let grpc_config = GrpcServerConfig {
             max_recv_message_size: opts.max_recv_message_size.as_bytes() as usize,
             max_send_message_size: opts.max_send_message_size.as_bytes() as usize,
+            tls: opts.tls.clone(),
         };
-
-        Ok(GrpcServerBuilder::new(grpc_config, grpc_runtime))
+        let builder = GrpcServerBuilder::new(grpc_config, grpc_runtime)
+            .with_tls_config(opts.tls.clone())
+            .context(error::InvalidTlsConfigSnafu)?;
+        Ok(builder)
     }
 
     pub fn http_server_builder(&self, opts: &FrontendOptions) -> HttpServerBuilder {
@@ -86,6 +88,8 @@ where
             ServerSqlQueryHandlerAdapter::arc(self.instance.clone()),
             Some(self.instance.clone()),
         );
+
+        builder = builder.with_log_ingest_handler(self.instance.clone());
 
         if let Some(user_provider) = self.plugins.get::<UserProviderRef>() {
             builder = builder.with_user_provider(user_provider);
@@ -137,11 +141,15 @@ where
         };
 
         let user_provider = self.plugins.get::<UserProviderRef>();
+        let runtime = match opts.mode {
+            Mode::Standalone => Some(builder.runtime().clone()),
+            _ => None,
+        };
 
         let greptime_request_handler = GreptimeRequestHandler::new(
             ServerGrpcQueryHandlerAdapter::arc(self.instance.clone()),
             user_provider.clone(),
-            builder.runtime().clone(),
+            runtime,
         );
 
         let grpc_server = builder
@@ -172,7 +180,7 @@ where
         let opts = self.opts.clone();
         let instance = self.instance.clone();
 
-        let toml = opts.to_toml()?;
+        let toml = opts.to_toml().context(TomlFormatSnafu)?;
         let opts: FrontendOptions = opts.into();
 
         let handlers = ServerHandlers::default();
@@ -256,24 +264,6 @@ where
             )) as Box<dyn Server>;
 
             handlers.insert((pg_server, pg_addr)).await;
-        }
-
-        if opts.opentsdb.enable {
-            // Init OpenTSDB server
-            let opts = &opts.opentsdb;
-            let addr = parse_addr(&opts.addr)?;
-
-            let io_runtime = Arc::new(
-                RuntimeBuilder::default()
-                    .worker_threads(opts.runtime_size)
-                    .thread_name("opentsdb-io-handlers")
-                    .build()
-                    .context(error::RuntimeResourceSnafu)?,
-            );
-
-            let server = OpentsdbServer::create_server(instance.clone(), io_runtime);
-
-            handlers.insert((server, addr)).await;
         }
 
         Ok(handlers)

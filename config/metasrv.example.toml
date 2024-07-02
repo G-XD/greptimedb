@@ -25,6 +25,15 @@ enable_telemetry = true
 ## If it's not empty, the metasrv will store all data with this key prefix.
 store_key_prefix = ""
 
+## The runtime options.
+[runtime]
+## The number of threads to execute the runtime for global read operations.
+read_rt_size = 8
+## The number of threads to execute the runtime for global write operations.
+write_rt_size = 8
+## The number of threads to execute the runtime for global background operations.
+bg_rt_size = 4
+
 ## Procedure storage options.
 [procedure]
 
@@ -45,7 +54,7 @@ max_metadata_value_size = "1500KiB"
 [failure_detector]
 threshold = 8.0
 min_std_deviation = "100ms"
-acceptable_heartbeat_pause = "3000ms"
+acceptable_heartbeat_pause = "10000ms"
 first_heartbeat_estimate = "1000ms"
 
 ## Datanode options.
@@ -141,3 +150,9 @@ url = ""
 
 ## HTTP headers of Prometheus remote-write carry.
 headers = { }
+
+## The tracing options. Only effect when compiled with `tokio-console` feature.
+[tracing]
+## The tokio console address.
+## +toml2docs:none-default
+tokio_console_addr = "127.0.0.1"

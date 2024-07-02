@@ -15,10 +15,9 @@
 use api::v1::ddl_request::{Expr as DdlExpr, Expr};
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
-use api::v1::{DeleteRequests, InsertRequests, RowDeleteRequests, RowInsertRequests};
+use api::v1::{DeleteRequests, DropFlowExpr, InsertRequests, RowDeleteRequests, RowInsertRequests};
 use async_trait::async_trait;
 use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
-use common_meta::table_name::TableName;
 use common_query::Output;
 use common_telemetry::tracing;
 use query::parser::PromQuery;
@@ -27,6 +26,7 @@ use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::QueryContextRef;
 use snafu::{ensure, OptionExt, ResultExt};
+use table::table_name::TableName;
 
 use crate::error::{
     Error, IncompleteGrpcRequestSnafu, NotSupportedSnafu, PermissionSnafu, Result,
@@ -111,17 +111,22 @@ impl GrpcQueryHandler for Instance {
                     DdlExpr::CreateTable(mut expr) => {
                         let _ = self
                             .statement_executor
-                            .create_table_inner(&mut expr, None, &ctx)
+                            .create_table_inner(&mut expr, None, ctx.clone())
                             .await?;
                         Output::new_with_affected_rows(0)
                     }
-                    DdlExpr::Alter(expr) => self.statement_executor.alter_table_inner(expr).await?,
+                    DdlExpr::Alter(expr) => {
+                        self.statement_executor
+                            .alter_table_inner(expr, ctx.clone())
+                            .await?
+                    }
                     DdlExpr::CreateDatabase(expr) => {
                         self.statement_executor
                             .create_database(
-                                ctx.current_catalog(),
                                 &expr.schema_name,
                                 expr.create_if_not_exists,
+                                expr.options,
+                                ctx.clone(),
                             )
                             .await?
                     }
@@ -129,19 +134,41 @@ impl GrpcQueryHandler for Instance {
                         let table_name =
                             TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
                         self.statement_executor
-                            .drop_table(table_name, expr.drop_if_exists)
+                            .drop_table(table_name, expr.drop_if_exists, ctx.clone())
                             .await?
                     }
                     DdlExpr::TruncateTable(expr) => {
                         let table_name =
                             TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
-                        self.statement_executor.truncate_table(table_name).await?
+                        self.statement_executor
+                            .truncate_table(table_name, ctx.clone())
+                            .await?
                     }
-                    DdlExpr::CreateFlow(_) => {
-                        unimplemented!()
+                    DdlExpr::CreateFlow(expr) => {
+                        self.statement_executor
+                            .create_flow_inner(expr, ctx.clone())
+                            .await?
                     }
-                    DdlExpr::DropFlow(_) => {
-                        unimplemented!()
+                    DdlExpr::DropFlow(DropFlowExpr {
+                        catalog_name,
+                        flow_name,
+                        drop_if_exists,
+                        ..
+                    }) => {
+                        self.statement_executor
+                            .drop_flow(catalog_name, flow_name, drop_if_exists, ctx.clone())
+                            .await?
+                    }
+                    DdlExpr::CreateView(expr) => {
+                        let _ = self
+                            .statement_executor
+                            .create_view_by_expr(expr, ctx.clone())
+                            .await?;
+
+                        Output::new_with_affected_rows(0)
+                    }
+                    DdlExpr::DropView(_) => {
+                        todo!("implemented in the following PR")
                     }
                 }
             }
@@ -190,6 +217,12 @@ fn fill_catalog_and_schema_from_context(ddl_expr: &mut DdlExpr, ctx: &QueryConte
             if expr.catalog_name.is_empty() {
                 expr.catalog_name = catalog.to_string();
             }
+        }
+        Expr::CreateView(expr) => {
+            check_and_fill!(expr);
+        }
+        Expr::DropView(expr) => {
+            check_and_fill!(expr);
         }
     }
 }

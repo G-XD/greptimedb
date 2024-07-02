@@ -22,15 +22,15 @@ use hydroflow::scheduled::port::{PortCtx, SEND};
 use itertools::Itertools;
 use snafu::{ensure, OptionExt, ResultExt};
 
-use crate::adapter::error::{Error, PlanSnafu};
 use crate::compute::render::{Context, SubgraphArg};
 use crate::compute::state::Scheduler;
 use crate::compute::types::{Arranged, Collection, CollectionBundle, ErrCollector, Toff};
-use crate::expr::error::{DataTypeSnafu, InternalSnafu};
+use crate::error::{Error, PlanSnafu};
+use crate::expr::error::{DataAlreadyExpiredSnafu, DataTypeSnafu, InternalSnafu};
 use crate::expr::{AggregateExpr, EvalError, ScalarExpr};
-use crate::plan::{AccumulablePlan, AggrWithIndex, KeyValPlan, Plan, ReducePlan};
-use crate::repr::{self, DiffRow, KeyValDiffRow, Row};
-use crate::utils::{ArrangeHandler, ArrangeReader, ArrangeWriter};
+use crate::plan::{AccumulablePlan, AggrWithIndex, KeyValPlan, Plan, ReducePlan, TypedPlan};
+use crate::repr::{self, DiffRow, KeyValDiffRow, RelationType, Row};
+use crate::utils::{ArrangeHandler, ArrangeReader, ArrangeWriter, KeyExpiryManager};
 
 impl<'referred, 'df> Context<'referred, 'df> {
     const REDUCE: &'static str = "reduce";
@@ -39,9 +39,10 @@ impl<'referred, 'df> Context<'referred, 'df> {
     #[allow(clippy::mutable_key_type)]
     pub fn render_reduce(
         &mut self,
-        input: Box<Plan>,
+        input: Box<TypedPlan>,
         key_val_plan: KeyValPlan,
         reduce_plan: ReducePlan,
+        output_type: RelationType,
     ) -> Result<CollectionBundle, Error> {
         let input = self.render_plan(*input)?;
         // first assembly key&val that's ((Row, Row), tick, diff)
@@ -52,6 +53,15 @@ impl<'referred, 'df> Context<'referred, 'df> {
 
         // TODO(discord9): config global expire time from self
         let arrange_handler = self.compute_state.new_arrange(None);
+
+        if let (Some(time_index), Some(expire_after)) =
+            (output_type.time_index, self.compute_state.expire_after())
+        {
+            let expire_man =
+                KeyExpiryManager::new(Some(expire_after), Some(ScalarExpr::Column(time_index)));
+            arrange_handler.write().set_expire_state(expire_man);
+        }
+
         // reduce need full arrangement to be able to query all keys
         let arrange_handler_inner = arrange_handler.clone_full_arrange().context(PlanSnafu {
             reason: "No write is expected at this point",
@@ -80,7 +90,11 @@ impl<'referred, 'df> Context<'referred, 'df> {
             out_send_port,
             move |_ctx, recv, send| {
                 // mfp only need to passively receive updates from recvs
-                let data = recv.take_inner().into_iter().flat_map(|v| v.into_iter());
+                let data = recv
+                    .take_inner()
+                    .into_iter()
+                    .flat_map(|v| v.into_iter())
+                    .collect_vec();
 
                 reduce_subgraph(
                     &reduce_arrange,
@@ -287,9 +301,13 @@ fn update_reduce_distinct_arrange(
     // Deal with output:
 
     // 1. Read all updates that were emitted between the last time this arrangement had updates and the current time.
-    let from = arrange.read().last_compaction_time().map(|n| n + 1);
+    let from = arrange.read().last_compaction_time();
     let from = from.unwrap_or(repr::Timestamp::MIN);
-    let output_kv = arrange.read().get_updates_in_range(from..=now);
+    let range = (
+        std::ops::Bound::Excluded(from),
+        std::ops::Bound::Included(now),
+    );
+    let output_kv = arrange.read().get_updates_in_range(range);
 
     // 2. Truncate all updates stored in arrangement within that range.
     let run_compaction = || {
@@ -378,12 +396,34 @@ fn reduce_accum_subgraph(
 
     let mut all_updates = Vec::with_capacity(key_to_vals.len());
     let mut all_outputs = Vec::with_capacity(key_to_vals.len());
-
     // lock the arrange for write for the rest of function body
-    // so to prevent wide race condition since we are going to update the arrangement by write after read
+    // so to prevent wired race condition since we are going to update the arrangement by write after read
     // TODO(discord9): consider key-based lock
     let mut arrange = arrange.write();
     for (key, value_diffs) in key_to_vals {
+        if let Some(expire_man) = &arrange.get_expire_state() {
+            let mut is_expired = false;
+            err_collector.run(|| {
+                if let Some(expired) = expire_man.get_expire_duration(now, &key)? {
+                    is_expired = true;
+                    // expired data is ignored in computation, and a simple warning is logged
+                    common_telemetry::warn!(
+                        "Data already expired: {}",
+                        DataAlreadyExpiredSnafu {
+                            expired_by: expired,
+                        }
+                        .build()
+                    );
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            });
+            if is_expired {
+                // errors already collected, we can just continue to next key
+                continue;
+            }
+        }
         let col_diffs = {
             let row_len = value_diffs[0].0.len();
             let res = err_collector.run(|| get_col_diffs(value_diffs, row_len));
@@ -395,6 +435,7 @@ fn reduce_accum_subgraph(
             }
         };
         let (accums, _, _) = arrange.get(now, &key).unwrap_or_default();
+
         let accums = accums.inner;
 
         // deser accums from offsets
@@ -725,13 +766,285 @@ mod test {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use datatypes::data_type::ConcreteDataType;
+    use common_time::{DateTime, Interval, Timestamp};
+    use datatypes::data_type::{ConcreteDataType, ConcreteDataType as CDT};
     use hydroflow::scheduled::graph::Hydroflow;
 
     use super::*;
     use crate::compute::render::test::{get_output_handle, harness_test_ctx, run_and_check};
     use crate::compute::state::DataflowState;
-    use crate::expr::{self, AggregateFunc, BinaryFunc, GlobalId, MapFilterProject};
+    use crate::expr::{self, AggregateFunc, BinaryFunc, GlobalId, MapFilterProject, UnaryFunc};
+    use crate::repr::{ColumnType, RelationType};
+
+    /// SELECT sum(number) FROM numbers_with_ts GROUP BY tumble(ts, '1 second', '2021-07-01 00:00:00')
+    /// input table columns: number, ts
+    /// expected: sum(number), window_start, window_end
+    #[test]
+    fn test_tumble_group_by() {
+        let mut df = Hydroflow::new();
+        let mut state = DataflowState::default();
+        let mut ctx = harness_test_ctx(&mut df, &mut state);
+        const START: i64 = 1625097600000;
+        let rows = vec![
+            (1u32, START + 1000),
+            (2u32, START + 1500),
+            (3u32, START + 2000),
+            (1u32, START + 2500),
+            (2u32, START + 3000),
+            (3u32, START + 3500),
+        ];
+        let rows = rows
+            .into_iter()
+            .map(|(number, ts)| {
+                (
+                    Row::new(vec![number.into(), Timestamp::new_millisecond(ts).into()]),
+                    1,
+                    1,
+                )
+            })
+            .collect_vec();
+
+        let collection = ctx.render_constant(rows.clone());
+        ctx.insert_global(GlobalId::User(1), collection);
+
+        let aggr_expr = AggregateExpr {
+            func: AggregateFunc::SumUInt32,
+            expr: ScalarExpr::Column(0),
+            distinct: false,
+        };
+        let expected = TypedPlan {
+            schema: RelationType::new(vec![
+                ColumnType::new(CDT::uint64_datatype(), true), // sum(number)
+                ColumnType::new(CDT::datetime_datatype(), false), // window start
+                ColumnType::new(CDT::datetime_datatype(), false), // window end
+            ])
+            .into_unnamed(),
+            // TODO(discord9): mfp indirectly ref to key columns
+            /*
+            .with_key(vec![1])
+            .with_time_index(Some(0)),*/
+            plan: Plan::Mfp {
+                input: Box::new(
+                    Plan::Reduce {
+                        input: Box::new(
+                            Plan::Get {
+                                id: crate::expr::Id::Global(GlobalId::User(1)),
+                            }
+                            .with_types(
+                                RelationType::new(vec![
+                                    ColumnType::new(ConcreteDataType::uint32_datatype(), false),
+                                    ColumnType::new(ConcreteDataType::datetime_datatype(), false),
+                                ])
+                                .into_unnamed(),
+                            ),
+                        ),
+                        key_val_plan: KeyValPlan {
+                            key_plan: MapFilterProject::new(2)
+                                .map(vec![
+                                    ScalarExpr::Column(1).call_unary(
+                                        UnaryFunc::TumbleWindowFloor {
+                                            window_size: Interval::from_month_day_nano(
+                                                0,
+                                                0,
+                                                1_000_000_000,
+                                            ),
+                                            start_time: Some(DateTime::new(1625097600000)),
+                                        },
+                                    ),
+                                    ScalarExpr::Column(1).call_unary(
+                                        UnaryFunc::TumbleWindowCeiling {
+                                            window_size: Interval::from_month_day_nano(
+                                                0,
+                                                0,
+                                                1_000_000_000,
+                                            ),
+                                            start_time: Some(DateTime::new(1625097600000)),
+                                        },
+                                    ),
+                                ])
+                                .unwrap()
+                                .project(vec![2, 3])
+                                .unwrap()
+                                .into_safe(),
+                            val_plan: MapFilterProject::new(2)
+                                .project(vec![0, 1])
+                                .unwrap()
+                                .into_safe(),
+                        },
+                        reduce_plan: ReducePlan::Accumulable(AccumulablePlan {
+                            full_aggrs: vec![aggr_expr.clone()],
+                            simple_aggrs: vec![AggrWithIndex::new(aggr_expr.clone(), 0, 0)],
+                            distinct_aggrs: vec![],
+                        }),
+                    }
+                    .with_types(
+                        RelationType::new(vec![
+                            ColumnType::new(CDT::datetime_datatype(), false), // window start
+                            ColumnType::new(CDT::datetime_datatype(), false), // window end
+                            ColumnType::new(CDT::uint64_datatype(), true),    //sum(number)
+                        ])
+                        .with_key(vec![1])
+                        .with_time_index(Some(0))
+                        .into_unnamed(),
+                    ),
+                ),
+                mfp: MapFilterProject::new(3)
+                    .map(vec![
+                        ScalarExpr::Column(2),
+                        ScalarExpr::Column(3),
+                        ScalarExpr::Column(0),
+                        ScalarExpr::Column(1),
+                    ])
+                    .unwrap()
+                    .project(vec![4, 5, 6])
+                    .unwrap(),
+            },
+        };
+
+        let bundle = ctx.render_plan(expected).unwrap();
+
+        let output = get_output_handle(&mut ctx, bundle);
+        drop(ctx);
+        let expected = BTreeMap::from([(
+            1,
+            vec![
+                (
+                    Row::new(vec![
+                        3u64.into(),
+                        Timestamp::new_millisecond(START + 1000).into(),
+                        Timestamp::new_millisecond(START + 2000).into(),
+                    ]),
+                    1,
+                    1,
+                ),
+                (
+                    Row::new(vec![
+                        4u64.into(),
+                        Timestamp::new_millisecond(START + 2000).into(),
+                        Timestamp::new_millisecond(START + 3000).into(),
+                    ]),
+                    1,
+                    1,
+                ),
+                (
+                    Row::new(vec![
+                        5u64.into(),
+                        Timestamp::new_millisecond(START + 3000).into(),
+                        Timestamp::new_millisecond(START + 4000).into(),
+                    ]),
+                    1,
+                    1,
+                ),
+            ],
+        )]);
+        run_and_check(&mut state, &mut df, 1..2, expected, output);
+    }
+
+    /// select avg(number) from number;
+    #[test]
+    fn test_avg_eval() {
+        let mut df = Hydroflow::new();
+        let mut state = DataflowState::default();
+        let mut ctx = harness_test_ctx(&mut df, &mut state);
+
+        let rows = vec![
+            (Row::new(vec![1u32.into()]), 1, 1),
+            (Row::new(vec![2u32.into()]), 1, 1),
+            (Row::new(vec![3u32.into()]), 1, 1),
+            (Row::new(vec![1u32.into()]), 1, 1),
+            (Row::new(vec![2u32.into()]), 1, 1),
+            (Row::new(vec![3u32.into()]), 1, 1),
+        ];
+        let collection = ctx.render_constant(rows.clone());
+        ctx.insert_global(GlobalId::User(1), collection);
+
+        let aggr_exprs = vec![
+            AggregateExpr {
+                func: AggregateFunc::SumUInt32,
+                expr: ScalarExpr::Column(0),
+                distinct: false,
+            },
+            AggregateExpr {
+                func: AggregateFunc::Count,
+                expr: ScalarExpr::Column(0),
+                distinct: false,
+            },
+        ];
+        let avg_expr = ScalarExpr::If {
+            cond: Box::new(ScalarExpr::Column(1).call_binary(
+                ScalarExpr::Literal(Value::from(0u32), CDT::int64_datatype()),
+                BinaryFunc::NotEq,
+            )),
+            then: Box::new(ScalarExpr::Column(0).call_binary(
+                ScalarExpr::Column(1).call_unary(UnaryFunc::Cast(CDT::uint64_datatype())),
+                BinaryFunc::DivUInt64,
+            )),
+            els: Box::new(ScalarExpr::Literal(Value::Null, CDT::uint64_datatype())),
+        };
+        let expected = TypedPlan {
+            schema: RelationType::new(vec![ColumnType::new(CDT::uint64_datatype(), true)])
+                .into_unnamed(),
+            plan: Plan::Mfp {
+                input: Box::new(
+                    Plan::Reduce {
+                        input: Box::new(
+                            Plan::Get {
+                                id: crate::expr::Id::Global(GlobalId::User(1)),
+                            }
+                            .with_types(
+                                RelationType::new(vec![ColumnType::new(
+                                    ConcreteDataType::int64_datatype(),
+                                    false,
+                                )])
+                                .into_unnamed(),
+                            ),
+                        ),
+                        key_val_plan: KeyValPlan {
+                            key_plan: MapFilterProject::new(1)
+                                .project(vec![])
+                                .unwrap()
+                                .into_safe(),
+                            val_plan: MapFilterProject::new(1)
+                                .project(vec![0])
+                                .unwrap()
+                                .into_safe(),
+                        },
+                        reduce_plan: ReducePlan::Accumulable(AccumulablePlan {
+                            full_aggrs: aggr_exprs.clone(),
+                            simple_aggrs: vec![
+                                AggrWithIndex::new(aggr_exprs[0].clone(), 0, 0),
+                                AggrWithIndex::new(aggr_exprs[1].clone(), 0, 1),
+                            ],
+                            distinct_aggrs: vec![],
+                        }),
+                    }
+                    .with_types(
+                        RelationType::new(vec![
+                            ColumnType::new(ConcreteDataType::uint32_datatype(), true),
+                            ColumnType::new(ConcreteDataType::int64_datatype(), true),
+                        ])
+                        .into_unnamed(),
+                    ),
+                ),
+                mfp: MapFilterProject::new(2)
+                    .map(vec![
+                        avg_expr,
+                        // TODO(discord9): optimize mfp so to remove indirect ref
+                        ScalarExpr::Column(2),
+                    ])
+                    .unwrap()
+                    .project(vec![3])
+                    .unwrap(),
+            },
+        };
+
+        let bundle = ctx.render_plan(expected).unwrap();
+
+        let output = get_output_handle(&mut ctx, bundle);
+        drop(ctx);
+        let expected = BTreeMap::from([(1, vec![(Row::new(vec![2u64.into()]), 1, 1)])]);
+        run_and_check(&mut state, &mut df, 1..2, expected, output);
+    }
 
     /// SELECT DISTINCT col FROM table
     ///
@@ -758,13 +1071,21 @@ mod test {
         let input_plan = Plan::Get {
             id: expr::Id::Global(GlobalId::User(1)),
         };
+        let typ = RelationType::new(vec![ColumnType::new_nullable(
+            ConcreteDataType::int64_datatype(),
+        )]);
         let key_val_plan = KeyValPlan {
             key_plan: MapFilterProject::new(1).project([0]).unwrap().into_safe(),
             val_plan: MapFilterProject::new(1).project([]).unwrap().into_safe(),
         };
         let reduce_plan = ReducePlan::Distinct;
         let bundle = ctx
-            .render_reduce(Box::new(input_plan), key_val_plan, reduce_plan)
+            .render_reduce(
+                Box::new(input_plan.with_types(typ.into_unnamed())),
+                key_val_plan,
+                reduce_plan,
+                RelationType::empty(),
+            )
             .unwrap();
 
         let output = get_output_handle(&mut ctx, bundle);
@@ -805,6 +1126,9 @@ mod test {
         let input_plan = Plan::Get {
             id: expr::Id::Global(GlobalId::User(1)),
         };
+        let typ = RelationType::new(vec![ColumnType::new_nullable(
+            ConcreteDataType::int64_datatype(),
+        )]);
         let key_val_plan = KeyValPlan {
             key_plan: MapFilterProject::new(1).project([]).unwrap().into_safe(),
             val_plan: MapFilterProject::new(1).project([0]).unwrap().into_safe(),
@@ -831,7 +1155,12 @@ mod test {
 
         let reduce_plan = ReducePlan::Accumulable(accum_plan);
         let bundle = ctx
-            .render_reduce(Box::new(input_plan), key_val_plan, reduce_plan)
+            .render_reduce(
+                Box::new(input_plan.with_types(typ.into_unnamed())),
+                key_val_plan,
+                reduce_plan,
+                RelationType::empty(),
+            )
             .unwrap();
 
         let output = get_output_handle(&mut ctx, bundle);
@@ -878,6 +1207,9 @@ mod test {
         let input_plan = Plan::Get {
             id: expr::Id::Global(GlobalId::User(1)),
         };
+        let typ = RelationType::new(vec![ColumnType::new_nullable(
+            ConcreteDataType::int64_datatype(),
+        )]);
         let key_val_plan = KeyValPlan {
             key_plan: MapFilterProject::new(1).project([]).unwrap().into_safe(),
             val_plan: MapFilterProject::new(1).project([0]).unwrap().into_safe(),
@@ -904,7 +1236,12 @@ mod test {
 
         let reduce_plan = ReducePlan::Accumulable(accum_plan);
         let bundle = ctx
-            .render_reduce(Box::new(input_plan), key_val_plan, reduce_plan)
+            .render_reduce(
+                Box::new(input_plan.with_types(typ.into_unnamed())),
+                key_val_plan,
+                reduce_plan,
+                RelationType::empty(),
+            )
             .unwrap();
 
         let output = get_output_handle(&mut ctx, bundle);
@@ -947,6 +1284,9 @@ mod test {
         let input_plan = Plan::Get {
             id: expr::Id::Global(GlobalId::User(1)),
         };
+        let typ = RelationType::new(vec![ColumnType::new_nullable(
+            ConcreteDataType::int64_datatype(),
+        )]);
         let key_val_plan = KeyValPlan {
             key_plan: MapFilterProject::new(1).project([]).unwrap().into_safe(),
             val_plan: MapFilterProject::new(1).project([0]).unwrap().into_safe(),
@@ -973,7 +1313,12 @@ mod test {
 
         let reduce_plan = ReducePlan::Accumulable(accum_plan);
         let bundle = ctx
-            .render_reduce(Box::new(input_plan), key_val_plan, reduce_plan)
+            .render_reduce(
+                Box::new(input_plan.with_types(typ.into_unnamed())),
+                key_val_plan,
+                reduce_plan,
+                RelationType::empty(),
+            )
             .unwrap();
 
         let output = get_output_handle(&mut ctx, bundle);
@@ -1016,6 +1361,9 @@ mod test {
         let input_plan = Plan::Get {
             id: expr::Id::Global(GlobalId::User(1)),
         };
+        let typ = RelationType::new(vec![ColumnType::new_nullable(
+            ConcreteDataType::int64_datatype(),
+        )]);
         let key_val_plan = KeyValPlan {
             key_plan: MapFilterProject::new(1).project([]).unwrap().into_safe(),
             val_plan: MapFilterProject::new(1).project([0]).unwrap().into_safe(),
@@ -1057,7 +1405,12 @@ mod test {
 
         let reduce_plan = ReducePlan::Accumulable(accum_plan);
         let bundle = ctx
-            .render_reduce(Box::new(input_plan), key_val_plan, reduce_plan)
+            .render_reduce(
+                Box::new(input_plan.with_types(typ.into_unnamed())),
+                key_val_plan,
+                reduce_plan,
+                RelationType::empty(),
+            )
             .unwrap();
 
         let output = get_output_handle(&mut ctx, bundle);

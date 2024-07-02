@@ -28,7 +28,7 @@ use common_error::status_code::StatusCode;
 use common_query::Output;
 use common_runtime::Runtime;
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
-use common_telemetry::{logging, tracing};
+use common_telemetry::{debug, error, tracing};
 use common_time::timezone::parse_timezone;
 use session::context::{QueryContextBuilder, QueryContextRef};
 use snafu::{OptionExt, ResultExt};
@@ -42,14 +42,14 @@ use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 pub struct GreptimeRequestHandler {
     handler: ServerGrpcQueryHandlerRef,
     user_provider: Option<UserProviderRef>,
-    runtime: Arc<Runtime>,
+    runtime: Option<Arc<Runtime>>,
 }
 
 impl GreptimeRequestHandler {
     pub fn new(
         handler: ServerGrpcQueryHandlerRef,
         user_provider: Option<UserProviderRef>,
-        runtime: Arc<Runtime>,
+        runtime: Option<Arc<Runtime>>,
     ) -> Self {
         Self {
             handler,
@@ -73,16 +73,9 @@ impl GreptimeRequestHandler {
         let request_type = request_type(&query).to_string();
         let db = query_ctx.get_db_string();
         let timer = RequestTimer::new(db.clone(), request_type);
-
-        // Executes requests in another runtime to
-        // 1. prevent the execution from being cancelled unexpected by Tonic runtime;
-        //   - Refer to our blog for the rational behind it:
-        //     https://www.greptime.com/blogs/2023-01-12-hidden-control-flow.html
-        //   - Obtaining a `JoinHandle` to get the panic message (if there's any).
-        //     From its docs, `JoinHandle` is cancel safe. The task keeps running even it's handle been dropped.
-        // 2. avoid the handler blocks the gRPC runtime incidentally.
         let tracing_context = TracingContext::from_current_span();
-        let handle = self.runtime.spawn(async move {
+
+        let result_future = async move {
             handler
                 .do_query(query, query_ctx)
                 .trace(tracing_context.attach(tracing::info_span!(
@@ -91,19 +84,35 @@ impl GreptimeRequestHandler {
                 .await
                 .map_err(|e| {
                     if e.status_code().should_log_error() {
-                        logging::error!(e; "Failed to handle request");
+                        error!(e; "Failed to handle request");
                     } else {
                         // Currently, we still print a debug log.
-                        logging::debug!("Failed to handle request, err: {:?}", e);
+                        debug!("Failed to handle request, err: {:?}", e);
                     }
                     e
                 })
-        });
+        };
 
-        handle.await.context(JoinTaskSnafu).map_err(|e| {
-            timer.record(e.status_code());
-            e
-        })?
+        match &self.runtime {
+            Some(runtime) => {
+                // Executes requests in another runtime to
+                // 1. prevent the execution from being cancelled unexpected by Tonic runtime;
+                //   - Refer to our blog for the rational behind it:
+                //     https://www.greptime.com/blogs/2023-01-12-hidden-control-flow.html
+                //   - Obtaining a `JoinHandle` to get the panic message (if there's any).
+                //     From its docs, `JoinHandle` is cancel safe. The task keeps running even it's handle been dropped.
+                // 2. avoid the handler blocks the gRPC runtime incidentally.
+                runtime
+                    .spawn(result_future)
+                    .await
+                    .context(JoinTaskSnafu)
+                    .map_err(|e| {
+                        timer.record(e.status_code());
+                        e
+                    })?
+            }
+            None => result_future.await,
+        }
     }
 }
 
@@ -190,6 +199,7 @@ pub(crate) fn create_query_context(header: Option<&RequestHeader>) -> QueryConte
         .current_schema(schema)
         .timezone(Arc::new(timezone))
         .build()
+        .into()
 }
 
 /// Histogram timer for handling gRPC request.

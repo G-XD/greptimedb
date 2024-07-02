@@ -83,18 +83,26 @@ impl UserDefinedLogicalNodeCore for InstantManipulate {
         )
     }
 
-    fn from_template(&self, _exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-        assert!(!inputs.is_empty());
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        if inputs.is_empty() {
+            return Err(DataFusionError::Internal(
+                "InstantManipulate should have at least one input".to_string(),
+            ));
+        }
 
-        Self {
+        Ok(Self {
             start: self.start,
             end: self.end,
             lookback_delta: self.lookback_delta,
             interval: self.interval,
             time_index_column: self.time_index_column.clone(),
             field_column: self.field_column.clone(),
-            input: inputs[0].clone(),
-        }
+            input: inputs.into_iter().next().unwrap(),
+        })
     }
 }
 
@@ -207,8 +215,8 @@ impl ExecutionPlan for InstantManipulateExec {
         vec![false; self.children().len()]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -342,12 +350,16 @@ impl InstantManipulateStream {
     // and the function `vectorSelectorSingle`
     pub fn manipulate(&self, input: RecordBatch) -> DataFusionResult<RecordBatch> {
         let mut take_indices = vec![];
-        // TODO(ruihang): maybe the input is not timestamp millisecond array
+
         let ts_column = input
             .column(self.time_index)
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
-            .unwrap();
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Time index Column downcast to TimestampMillisecondArray failed".into(),
+                )
+            })?;
 
         // field column for staleness check
         let field_column = self

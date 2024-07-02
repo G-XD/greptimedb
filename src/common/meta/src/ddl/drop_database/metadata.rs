@@ -68,7 +68,7 @@ impl DropMetadataBroadcast {
         cache_invalidator
             .invalidate(
                 &ctx,
-                vec![CacheIdent::SchemaName(SchemaName {
+                &[CacheIdent::SchemaName(SchemaName {
                     catalog_name: db_ctx.catalog.clone(),
                     schema_name: db_ctx.schema.clone(),
                 })],
@@ -118,6 +118,7 @@ mod tests {
             .unwrap();
         let mut state = DropDatabaseRemoveMetadata;
         let mut ctx = DropDatabaseContext {
+            cluster_id: 0,
             catalog: "foo".to_string(),
             schema: "bar".to_string(),
             drop_if_exists: true,
@@ -144,6 +145,7 @@ mod tests {
         // Schema not exists
         let mut state = DropDatabaseRemoveMetadata;
         let mut ctx = DropDatabaseContext {
+            cluster_id: 0,
             catalog: "foo".to_string(),
             schema: "bar".to_string(),
             drop_if_exists: true,

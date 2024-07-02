@@ -23,7 +23,6 @@ use common_function::function::FunctionRef;
 use common_function::scalars::aggregate::AggregateFunctionMetaRef;
 use common_query::prelude::ScalarUdf;
 use common_query::Output;
-use common_recordbatch::SendableRecordBatchStream;
 use common_runtime::Runtime;
 use query::dataframe::DataFrame;
 use query::plan::LogicalPlan;
@@ -32,7 +31,7 @@ use query::query_engine::DescribeResult;
 use query::{QueryEngine, QueryEngineContext};
 use session::context::QueryContextRef;
 use store_api::metadata::RegionMetadataRef;
-use store_api::region_engine::{RegionEngine, RegionRole, SetReadonlyResponse};
+use store_api::region_engine::{RegionEngine, RegionRole, RegionScannerRef, SetReadonlyResponse};
 use store_api::region_request::{AffectedRows, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest};
 use table::TableRef;
@@ -106,10 +105,11 @@ pub struct MockRegionEngine {
     pub(crate) handle_request_delay: Option<Duration>,
     pub(crate) handle_request_mock_fn: Option<MockRequestHandler>,
     pub(crate) mock_role: Option<Option<RegionRole>>,
+    engine: String,
 }
 
 impl MockRegionEngine {
-    pub fn new() -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
+    pub fn new(engine: &str) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
 
         (
@@ -118,12 +118,14 @@ impl MockRegionEngine {
                 sender: tx,
                 handle_request_mock_fn: None,
                 mock_role: None,
+                engine: engine.to_string(),
             }),
             rx,
         )
     }
 
     pub fn with_mock_fn(
+        engine: &str,
         mock_fn: MockRequestHandler,
     ) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -134,12 +136,16 @@ impl MockRegionEngine {
                 sender: tx,
                 handle_request_mock_fn: Some(mock_fn),
                 mock_role: None,
+                engine: engine.to_string(),
             }),
             rx,
         )
     }
 
-    pub fn with_custom_apply_fn<F>(apply: F) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>)
+    pub fn with_custom_apply_fn<F>(
+        engine: &str,
+        apply: F,
+    ) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>)
     where
         F: FnOnce(&mut MockRegionEngine),
     {
@@ -149,6 +155,7 @@ impl MockRegionEngine {
             sender: tx,
             handle_request_mock_fn: None,
             mock_role: None,
+            engine: engine.to_string(),
         };
 
         apply(&mut region_engine);
@@ -160,7 +167,7 @@ impl MockRegionEngine {
 #[async_trait::async_trait]
 impl RegionEngine for MockRegionEngine {
     fn name(&self) -> &str {
-        "mock"
+        &self.engine
     }
 
     async fn handle_request(
@@ -185,7 +192,7 @@ impl RegionEngine for MockRegionEngine {
         &self,
         _region_id: RegionId,
         _request: ScanRequest,
-    ) -> Result<SendableRecordBatchStream, BoxedError> {
+    ) -> Result<RegionScannerRef, BoxedError> {
         unimplemented!()
     }
 
@@ -193,7 +200,7 @@ impl RegionEngine for MockRegionEngine {
         unimplemented!()
     }
 
-    async fn region_disk_usage(&self, _region_id: RegionId) -> Option<i64> {
+    fn region_disk_usage(&self, _region_id: RegionId) -> Option<i64> {
         unimplemented!()
     }
 

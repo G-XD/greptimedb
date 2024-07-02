@@ -147,7 +147,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records" :{"schema":{"column_schemas":[{"name":"number","data_type":"UInt32"}]},"rows":[[0],[1],[2],[3],[4],[5],[6],[7],[8],[9]]}
+            "records" :{"schema":{"column_schemas":[{"name":"number","data_type":"UInt32"}]},"rows":[[0],[1],[2],[3],[4],[5],[6],[7],[8],[9]],"total_rows":10}
         })).unwrap()
     );
 
@@ -189,7 +189,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"host","data_type":"String"},{"name":"cpu","data_type":"Float64"},{"name":"memory","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[["host",66.6,1024.0,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"host","data_type":"String"},{"name":"cpu","data_type":"Float64"},{"name":"memory","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[["host",66.6,1024.0,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -207,7 +207,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -224,7 +224,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"c","data_type":"Float64"},{"name":"time","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"c","data_type":"Float64"},{"name":"time","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -241,13 +241,13 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         outputs[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
     assert_eq!(
         outputs[1],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"rows":[], "schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]}}
+            "records":{"rows":[], "schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]}, "total_rows":0}
         }))
         .unwrap()
     );
@@ -276,7 +276,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         outputs[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -302,7 +302,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     assert_eq!(
         outputs[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]]}
+            "records":{"schema":{"column_schemas":[{"name":"cpu","data_type":"Float64"},{"name":"ts","data_type":"TimestampMillisecond"}]},"rows":[[66.6,0]],"total_rows":1}
         })).unwrap()
     );
 
@@ -492,7 +492,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
 
     // series
     let res = client
-        .get("/v1/prometheus/api/v1/series?match[]=demo&start=0&end=0")
+        .get("/v1/prometheus/api/v1/series?match[]=demo{}&start=0&end=0")
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -508,10 +508,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .collect::<BTreeMap<String, String>>();
     let expected = BTreeMap::from([
         ("__name__".to_string(), "demo".to_string()),
-        ("ts".to_string(), "1970-01-01 00:00:00+0000".to_string()),
-        ("cpu".to_string(), "1.1".to_string()),
         ("host".to_string(), "host1".to_string()),
-        ("memory".to_string(), "2.2".to_string()),
     ]);
     assert_eq!(actual, expected);
 
@@ -545,6 +542,19 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     assert_eq!(
         body.data,
         serde_json::from_value::<PrometheusResponse>(json!(["host1", "host2"])).unwrap()
+    );
+
+    // search field name
+    let res = client
+        .get("/v1/prometheus/api/v1/label/__field__/values?match[]=demo")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(json!(["cpu", "memory"])).unwrap()
     );
 
     // query an empty database should return nothing
@@ -663,7 +673,7 @@ def test(n) -> vector[f64]:
     assert_eq!(
         output[0],
         serde_json::from_value::<GreptimeQueryOutput>(json!({
-            "records":{"schema":{"column_schemas":[{"name":"n","data_type":"Float64"}]},"rows":[[1.0],[2.0],[3.0],[4.0],[5.0],[6.0],[7.0],[8.0],[9.0],[10.0]]}
+            "records":{"schema":{"column_schemas":[{"name":"n","data_type":"Float64"}]},"rows":[[1.0],[2.0],[3.0],[4.0],[5.0],[6.0],[7.0],[8.0],[9.0],[10.0]],"total_rows": 10}
         })).unwrap()
     );
 
@@ -719,105 +729,61 @@ pub async fn test_config_api(store_type: StorageType) {
 
     let expected_toml_str = format!(
         r#"
-[procedure]
-max_retry_times = 3
-retry_delay = "500ms"
-
-[metadata_store]
-file_size = "256MiB"
-purge_threshold = "4GiB"
-
-[frontend]
 mode = "standalone"
+enable_telemetry = true
 
-[frontend.heartbeat]
-interval = "18s"
-retry_interval = "3s"
-
-[frontend.http]
+[http]
 addr = "127.0.0.1:4000"
 timeout = "30s"
 body_limit = "64MiB"
 is_strict_mode = false
 
-[frontend.grpc]
+[grpc]
 addr = "127.0.0.1:4001"
-runtime_size = 8
+hostname = "127.0.0.1"
 max_recv_message_size = "512MiB"
 max_send_message_size = "512MiB"
+runtime_size = 8
 
-[frontend.mysql]
+[grpc.tls]
+mode = "disable"
+cert_path = ""
+key_path = ""
+watch = false
+
+[mysql]
 enable = true
 addr = "127.0.0.1:4002"
 runtime_size = 2
 
-[frontend.mysql.tls]
+[mysql.tls]
 mode = "disable"
 cert_path = ""
 key_path = ""
 watch = false
 
-[frontend.postgres]
+[postgres]
 enable = true
 addr = "127.0.0.1:4003"
 runtime_size = 2
 
-[frontend.postgres.tls]
+[postgres.tls]
 mode = "disable"
 cert_path = ""
 key_path = ""
 watch = false
 
-[frontend.opentsdb]
-enable = true
-addr = "127.0.0.1:4242"
-runtime_size = 2
-
-[frontend.influxdb]
+[opentsdb]
 enable = true
 
-[frontend.prom_store]
+[influxdb]
+enable = true
+
+[prom_store]
 enable = true
 with_metric_engine = true
 
-[frontend.otlp]
-enable = true
-
-[frontend.logging]
-enable_otlp_tracing = false
-append_stdout = true
-
-[frontend.datanode.client]
-timeout = "10s"
-connect_timeout = "1s"
-tcp_nodelay = true
-
-[frontend.export_metrics]
-enable = false
-write_interval = "30s"
-
-[datanode]
-mode = "standalone"
-node_id = 0
-require_lease_before_startup = true
-init_regions_in_background = false
-rpc_addr = "127.0.0.1:3001"
-rpc_runtime_size = 8
-rpc_max_recv_message_size = "512MiB"
-rpc_max_send_message_size = "512MiB"
-enable_telemetry = true
-
-[datanode.heartbeat]
-interval = "3s"
-retry_interval = "3s"
-
-[datanode.http]
-addr = "127.0.0.1:4000"
-timeout = "30s"
-body_limit = "64MiB"
-is_strict_mode = false
-
-[datanode.wal]
+[wal]
 provider = "raft_engine"
 file_size = "256MiB"
 purge_threshold = "4GiB"
@@ -827,13 +793,25 @@ sync_write = false
 enable_log_recycle = true
 prefill_log_files = false
 
-[datanode.storage]
+[storage]
 type = "{}"
 providers = []
 
-[[datanode.region_engine]]
+[metadata_store]
+file_size = "256MiB"
+purge_threshold = "4GiB"
 
-[datanode.region_engine.mito]
+[procedure]
+max_retry_times = 3
+retry_delay = "500ms"
+
+[logging]
+enable_otlp_tracing = false
+append_stdout = true
+
+[[region_engine]]
+
+[region_engine.mito]
 worker_channel_size = 128
 worker_request_batch_size = 64
 manifest_checkpoint_distance = 10
@@ -843,11 +821,12 @@ auto_flush_interval = "30m"
 enable_experimental_write_cache = false
 experimental_write_cache_path = ""
 experimental_write_cache_size = "512MiB"
+experimental_write_cache_ttl = "1h"
 sst_write_buffer_size = "8MiB"
 parallel_scan_channel_size = 32
 allow_stale_entries = false
 
-[datanode.region_engine.mito.inverted_index]
+[region_engine.mito.inverted_index]
 create_on_flush = "auto"
 create_on_compaction = "auto"
 apply_on_query = "auto"
@@ -855,29 +834,22 @@ write_buffer_size = "8MiB"
 mem_threshold_on_create = "64.0MiB"
 intermediate_path = ""
 
-[datanode.region_engine.mito.memtable]
+[region_engine.mito.memtable]
 type = "time_series"
 
-[[datanode.region_engine]]
+[[region_engine]]
 
-[datanode.region_engine.file]
+[region_engine.file]
 
-[datanode.logging]
-enable_otlp_tracing = false
-append_stdout = true
-
-[datanode.export_metrics]
+[export_metrics]
 enable = false
 write_interval = "30s"
 
-[logging]
-enable_otlp_tracing = false
-append_stdout = true
-
-[wal_meta]
-provider = "raft_engine""#,
-        store_type,
-    );
+[tracing]"#,
+        store_type
+    )
+    .trim()
+    .to_string();
     let body_text = drop_lines_with_inconsistent_results(res_get.text().await);
     assert_eq!(body_text, expected_toml_str);
 }
@@ -989,6 +961,31 @@ pub async fn test_vm_proto_remote_write(store_type: StorageType) {
     let serialized_request = write_request.encode_to_vec();
     let compressed_request =
         zstd::stream::encode_all(&serialized_request[..], 1).expect("Failed to encode zstd");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "zstd")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // also test fallback logic, vmagent could sent data in wrong content-type
+    // we encode it as zstd but send it as snappy
+    let compressed_request =
+        zstd::stream::encode_all(&serialized_request[..], 1).expect("Failed to encode zstd");
+
+    let res = client
+        .post("/v1/prometheus/write")
+        .header("Content-Encoding", "snappy")
+        .body(compressed_request)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // reversed
+    let compressed_request =
+        prom_store::snappy_compress(&serialized_request[..]).expect("Failed to encode snappy");
 
     let res = client
         .post("/v1/prometheus/write")

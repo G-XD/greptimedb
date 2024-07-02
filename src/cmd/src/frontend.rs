@@ -16,15 +16,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use catalog::kvbackend::{CachedMetaKvBackendBuilder, KvBackendCatalogManager};
+use cache::{build_fundamental_cache_registry, with_default_composite_cache_registry};
+use catalog::kvbackend::{CachedMetaKvBackendBuilder, KvBackendCatalogManager, MetaKvBackend};
 use clap::Parser;
-use client::client_manager::DatanodeClients;
-use common_meta::cache_invalidator::MultiCacheInvalidator;
+use client::client_manager::NodeClients;
+use common_config::Configurable;
+use common_grpc::channel_manager::ChannelConfig;
+use common_meta::cache::{CacheRegistryBuilder, LayeredCacheRegistryBuilder};
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
 use common_meta::heartbeat::handler::HandlerGroupExecutor;
-use common_telemetry::logging;
+use common_telemetry::info;
+use common_telemetry::logging::TracingOptions;
 use common_time::timezone::set_default_timezone;
-use frontend::frontend::FrontendOptions;
+use common_version::{short_version, version};
 use frontend::heartbeat::handler::invalidate_table_cache::InvalidateTableCacheHandler;
 use frontend::heartbeat::HeartbeatTask;
 use frontend::instance::builder::FrontendBuilder;
@@ -34,18 +38,31 @@ use meta_client::MetaClientOptions;
 use servers::tls::{TlsMode, TlsOption};
 use servers::Mode;
 use snafu::{OptionExt, ResultExt};
+use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::error::{self, InitTimezoneSnafu, MissingConfigSnafu, Result, StartFrontendSnafu};
-use crate::options::{CliOptions, Options};
-use crate::App;
+use crate::error::{
+    self, InitTimezoneSnafu, LoadLayeredConfigSnafu, MissingConfigSnafu, Result, StartFrontendSnafu,
+};
+use crate::options::{GlobalOptions, GreptimeOptions};
+use crate::{log_versions, App};
+
+type FrontendOptions = GreptimeOptions<frontend::frontend::FrontendOptions>;
 
 pub struct Instance {
     frontend: FeInstance,
+
+    // Keep the logging guard to prevent the worker from being dropped.
+    _guard: Vec<WorkerGuard>,
 }
 
+pub const APP_NAME: &str = "greptime-frontend";
+
 impl Instance {
-    pub fn new(frontend: FeInstance) -> Self {
-        Self { frontend }
+    pub fn new(frontend: FeInstance, guard: Vec<WorkerGuard>) -> Self {
+        Self {
+            frontend,
+            _guard: guard,
+        }
     }
 
     pub fn mut_inner(&mut self) -> &mut FeInstance {
@@ -60,7 +77,7 @@ impl Instance {
 #[async_trait]
 impl App for Instance {
     fn name(&self) -> &str {
-        "greptime-frontend"
+        APP_NAME
     }
 
     async fn start(&mut self) -> Result<()> {
@@ -86,12 +103,12 @@ pub struct Command {
 }
 
 impl Command {
-    pub async fn build(self, opts: FrontendOptions) -> Result<Instance> {
+    pub async fn build(&self, opts: FrontendOptions) -> Result<Instance> {
         self.subcmd.build(opts).await
     }
 
-    pub fn load_options(&self, cli_options: &CliOptions) -> Result<Options> {
-        self.subcmd.load_options(cli_options)
+    pub fn load_options(&self, global_options: &GlobalOptions) -> Result<FrontendOptions> {
+        self.subcmd.load_options(global_options)
     }
 }
 
@@ -101,15 +118,15 @@ enum SubCommand {
 }
 
 impl SubCommand {
-    async fn build(self, opts: FrontendOptions) -> Result<Instance> {
+    async fn build(&self, opts: FrontendOptions) -> Result<Instance> {
         match self {
             SubCommand::Start(cmd) => cmd.build(opts).await,
         }
     }
 
-    fn load_options(&self, cli_options: &CliOptions) -> Result<Options> {
+    fn load_options(&self, global_options: &GlobalOptions) -> Result<FrontendOptions> {
         match self {
-            SubCommand::Start(cmd) => cmd.load_options(cli_options),
+            SubCommand::Start(cmd) => cmd.load_options(global_options),
         }
     }
 }
@@ -126,14 +143,12 @@ pub struct StartCommand {
     mysql_addr: Option<String>,
     #[clap(long)]
     postgres_addr: Option<String>,
-    #[clap(long)]
-    opentsdb_addr: Option<String>,
     #[clap(short, long)]
     config_file: Option<String>,
     #[clap(short, long)]
     influxdb_enable: Option<bool>,
-    #[clap(long, value_delimiter = ',', num_args = 1..)]
-    metasrv_addr: Option<Vec<String>>,
+    #[clap(long, aliases = ["metasrv-addr"], value_delimiter = ',', num_args = 1..)]
+    metasrv_addrs: Option<Vec<String>>,
     #[clap(long)]
     tls_mode: Option<TlsMode>,
     #[clap(long)]
@@ -149,20 +164,38 @@ pub struct StartCommand {
 }
 
 impl StartCommand {
-    fn load_options(&self, cli_options: &CliOptions) -> Result<Options> {
-        let mut opts: FrontendOptions = Options::load_layered_options(
+    fn load_options(&self, global_options: &GlobalOptions) -> Result<FrontendOptions> {
+        let mut opts = FrontendOptions::load_layered_options(
             self.config_file.as_deref(),
             self.env_prefix.as_ref(),
-            FrontendOptions::env_list_keys(),
-        )?;
+        )
+        .context(LoadLayeredConfigSnafu)?;
 
-        if let Some(dir) = &cli_options.log_dir {
+        self.merge_with_cli_options(global_options, &mut opts)?;
+
+        Ok(opts)
+    }
+
+    // The precedence order is: cli > config file > environment variables > default values.
+    fn merge_with_cli_options(
+        &self,
+        global_options: &GlobalOptions,
+        opts: &mut FrontendOptions,
+    ) -> Result<()> {
+        let opts = &mut opts.component;
+
+        if let Some(dir) = &global_options.log_dir {
             opts.logging.dir.clone_from(dir);
         }
 
-        if cli_options.log_level.is_some() {
-            opts.logging.level.clone_from(&cli_options.log_level);
+        if global_options.log_level.is_some() {
+            opts.logging.level.clone_from(&global_options.log_level);
         }
+
+        opts.tracing = TracingOptions {
+            #[cfg(feature = "tokio-console")]
+            tokio_console_addr: global_options.tokio_console_addr.clone(),
+        };
 
         let tls_opts = TlsOption::new(
             self.tls_mode.clone(),
@@ -184,6 +217,7 @@ impl StartCommand {
 
         if let Some(addr) = &self.rpc_addr {
             opts.grpc.addr.clone_from(addr);
+            opts.grpc.tls = tls_opts.clone();
         }
 
         if let Some(addr) = &self.mysql_addr {
@@ -198,16 +232,11 @@ impl StartCommand {
             opts.postgres.tls = tls_opts;
         }
 
-        if let Some(addr) = &self.opentsdb_addr {
-            opts.opentsdb.enable = true;
-            opts.opentsdb.addr.clone_from(addr);
-        }
-
         if let Some(enable) = self.influxdb_enable {
             opts.influxdb.enable = enable;
         }
 
-        if let Some(metasrv_addrs) = &self.metasrv_addr {
+        if let Some(metasrv_addrs) = &self.metasrv_addrs {
             opts.meta_client
                 .get_or_insert_with(MetaClientOptions::default)
                 .metasrv_addrs
@@ -217,17 +246,28 @@ impl StartCommand {
 
         opts.user_provider.clone_from(&self.user_provider);
 
-        Ok(Options::Frontend(Box::new(opts)))
+        Ok(())
     }
 
-    async fn build(self, mut opts: FrontendOptions) -> Result<Instance> {
+    async fn build(&self, opts: FrontendOptions) -> Result<Instance> {
+        common_runtime::init_global_runtimes(&opts.runtime);
+
+        let guard = common_telemetry::init_global_logging(
+            APP_NAME,
+            &opts.component.logging,
+            &opts.component.tracing,
+            opts.component.node_id.clone(),
+        );
+        log_versions(version!(), short_version!());
+
+        info!("Frontend start command: {:#?}", self);
+        info!("Frontend options: {:#?}", opts);
+
+        let mut opts = opts.component;
         #[allow(clippy::unnecessary_mut_passed)]
         let plugins = plugins::setup_frontend_plugins(&mut opts)
             .await
             .context(StartFrontendSnafu)?;
-
-        logging::info!("Frontend start command: {:#?}", self);
-        logging::info!("Frontend options: {:#?}", opts);
 
         set_default_timezone(opts.default_timezone.as_deref()).context(InitTimezoneSnafu)?;
 
@@ -243,27 +283,41 @@ impl StartCommand {
             .await
             .context(StartFrontendSnafu)?;
 
+        // TODO(discord9): add helper function to ease the creation of cache registry&such
         let cached_meta_backend = CachedMetaKvBackendBuilder::new(meta_client.clone())
             .cache_max_capacity(cache_max_capacity)
             .cache_ttl(cache_ttl)
             .cache_tti(cache_tti)
             .build();
         let cached_meta_backend = Arc::new(cached_meta_backend);
-        let multi_cache_invalidator = Arc::new(MultiCacheInvalidator::with_invalidators(vec![
-            cached_meta_backend.clone(),
-        ]));
+
+        // Builds cache registry
+        let layered_cache_builder = LayeredCacheRegistryBuilder::default().add_cache_registry(
+            CacheRegistryBuilder::default()
+                .add_cache(cached_meta_backend.clone())
+                .build(),
+        );
+        let fundamental_cache_registry =
+            build_fundamental_cache_registry(Arc::new(MetaKvBackend::new(meta_client.clone())));
+        let layered_cache_registry = Arc::new(
+            with_default_composite_cache_registry(
+                layered_cache_builder.add_cache_registry(fundamental_cache_registry),
+            )
+            .context(error::BuildCacheRegistrySnafu)?
+            .build(),
+        );
+
         let catalog_manager = KvBackendCatalogManager::new(
             opts.mode,
             Some(meta_client.clone()),
             cached_meta_backend.clone(),
-            multi_cache_invalidator.clone(),
-        )
-        .await;
+            layered_cache_registry.clone(),
+        );
 
         let executor = HandlerGroupExecutor::new(vec![
             Arc::new(ParseMailboxMessageHandler),
             Arc::new(InvalidateTableCacheHandler::new(
-                multi_cache_invalidator.clone(),
+                layered_cache_registry.clone(),
             )),
         ]);
 
@@ -274,28 +328,38 @@ impl StartCommand {
             Arc::new(executor),
         );
 
+        // frontend to datanode need not timeout.
+        // Some queries are expected to take long time.
+        let channel_config = ChannelConfig {
+            timeout: None,
+            ..Default::default()
+        };
+        let client = NodeClients::new(channel_config);
+
         let mut instance = FrontendBuilder::new(
+            opts.clone(),
             cached_meta_backend.clone(),
+            layered_cache_registry.clone(),
             catalog_manager,
-            Arc::new(DatanodeClients::default()),
+            Arc::new(client),
             meta_client,
         )
         .with_plugin(plugins.clone())
-        .with_cache_invalidator(multi_cache_invalidator)
+        .with_local_cache_invalidator(layered_cache_registry)
         .with_heartbeat_task(heartbeat_task)
         .try_build()
         .await
         .context(StartFrontendSnafu)?;
 
-        let servers = Services::new(opts.clone(), Arc::new(instance.clone()), plugins)
+        let servers = Services::new(opts, Arc::new(instance.clone()), plugins)
             .build()
             .await
             .context(StartFrontendSnafu)?;
         instance
-            .build_servers(opts, servers)
+            .build_servers(servers)
             .context(StartFrontendSnafu)?;
 
-        Ok(Instance::new(instance))
+        Ok(Instance::new(instance, guard))
     }
 }
 
@@ -306,12 +370,13 @@ mod tests {
 
     use auth::{Identity, Password, UserProviderRef};
     use common_base::readable_size::ReadableSize;
+    use common_config::ENV_VAR_SEP;
     use common_test_util::temp_dir::create_named_temp_file;
-    use frontend::service_config::GrpcOptions;
+    use servers::grpc::GrpcOptions;
     use servers::http::HttpOptions;
 
     use super::*;
-    use crate::options::{CliOptions, ENV_VAR_SEP};
+    use crate::options::GlobalOptions;
 
     #[test]
     fn test_try_from_start_command() {
@@ -319,23 +384,19 @@ mod tests {
             http_addr: Some("127.0.0.1:1234".to_string()),
             mysql_addr: Some("127.0.0.1:5678".to_string()),
             postgres_addr: Some("127.0.0.1:5432".to_string()),
-            opentsdb_addr: Some("127.0.0.1:4321".to_string()),
             influxdb_enable: Some(false),
             disable_dashboard: Some(false),
             ..Default::default()
         };
 
-        let Options::Frontend(opts) = command.load_options(&CliOptions::default()).unwrap() else {
-            unreachable!()
-        };
+        let opts = command.load_options(&Default::default()).unwrap().component;
 
         assert_eq!(opts.http.addr, "127.0.0.1:1234");
         assert_eq!(ReadableSize::mb(64), opts.http.body_limit);
         assert_eq!(opts.mysql.addr, "127.0.0.1:5678");
         assert_eq!(opts.postgres.addr, "127.0.0.1:5432");
-        assert_eq!(opts.opentsdb.addr, "127.0.0.1:4321");
 
-        let default_opts = FrontendOptions::default();
+        let default_opts = FrontendOptions::default().component;
 
         assert_eq!(opts.grpc.addr, default_opts.grpc.addr);
         assert!(opts.mysql.enable);
@@ -346,10 +407,6 @@ mod tests {
             default_opts.postgres.runtime_size
         );
         assert!(opts.opentsdb.enable);
-        assert_eq!(
-            opts.opentsdb.runtime_size,
-            default_opts.opentsdb.runtime_size
-        );
 
         assert!(!opts.influxdb.enable);
     }
@@ -365,6 +422,9 @@ mod tests {
             timeout = "30s"
             body_limit = "2GB"
 
+            [opentsdb]
+            enable = false
+
             [logging]
             level = "debug"
             dir = "/tmp/greptimedb/test/logs"
@@ -377,10 +437,8 @@ mod tests {
             ..Default::default()
         };
 
-        let Options::Frontend(fe_opts) = command.load_options(&CliOptions::default()).unwrap()
-        else {
-            unreachable!()
-        };
+        let fe_opts = command.load_options(&Default::default()).unwrap().component;
+
         assert_eq!(Mode::Distributed, fe_opts.mode);
         assert_eq!("127.0.0.1:4000".to_string(), fe_opts.http.addr);
         assert_eq!(Duration::from_secs(30), fe_opts.http.timeout);
@@ -389,11 +447,12 @@ mod tests {
 
         assert_eq!("debug", fe_opts.logging.level.as_ref().unwrap());
         assert_eq!("/tmp/greptimedb/test/logs".to_string(), fe_opts.logging.dir);
+        assert!(!fe_opts.opentsdb.enable);
     }
 
     #[tokio::test]
     async fn test_try_from_start_command_to_anymap() {
-        let mut fe_opts = FrontendOptions {
+        let mut fe_opts = frontend::frontend::FrontendOptions {
             http: HttpOptions {
                 disable_dashboard: false,
                 ..Default::default()
@@ -423,16 +482,17 @@ mod tests {
         };
 
         let options = cmd
-            .load_options(&CliOptions {
+            .load_options(&GlobalOptions {
                 log_dir: Some("/tmp/greptimedb/test/logs".to_string()),
                 log_level: Some("debug".to_string()),
 
                 #[cfg(feature = "tokio-console")]
                 tokio_console_addr: None,
             })
-            .unwrap();
+            .unwrap()
+            .component;
 
-        let logging_opt = options.logging_options();
+        let logging_opt = options.logging;
         assert_eq!("/tmp/greptimedb/test/logs", logging_opt.dir);
         assert_eq!("debug", logging_opt.level.as_ref().unwrap());
     }
@@ -508,11 +568,7 @@ mod tests {
                     ..Default::default()
                 };
 
-                let Options::Frontend(fe_opts) =
-                    command.load_options(&CliOptions::default()).unwrap()
-                else {
-                    unreachable!()
-                };
+                let fe_opts = command.load_options(&Default::default()).unwrap().component;
 
                 // Should be read from env, env > default values.
                 assert_eq!(fe_opts.mysql.runtime_size, 11);

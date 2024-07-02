@@ -36,6 +36,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use snafu::ResultExt;
+use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 use self::csv::CsvFormat;
 use self::json::JsonFormat;
@@ -45,6 +46,7 @@ use crate::buffered_writer::{DfRecordBatchEncoder, LazyBufferedWriter};
 use crate::compression::CompressionType;
 use crate::error::{self, Result};
 use crate::share_buffer::SharedBuffer;
+use crate::DEFAULT_WRITE_BUFFER_SIZE;
 
 pub const FORMAT_COMPRESSION_TYPE: &str = "compression_type";
 pub const FORMAT_DELIMITER: &str = "delimiter";
@@ -146,6 +148,9 @@ pub fn open_with_decoder<T: ArrowDecoder, F: Fn() -> DataFusionResult<T>>(
         let reader = object_store
             .reader(&path)
             .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .into_bytes_stream(..)
+            .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let mut upstream = compression_type.convert_stream(reader).fuse();
@@ -202,7 +207,9 @@ pub async fn stream_to_file<T: DfRecordBatchEncoder, U: Fn(SharedBuffer) -> T>(
         store
             .writer_with(&path)
             .concurrent(concurrency)
+            .chunk(DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize)
             .await
+            .map(|v| v.into_futures_async_write().compat_write())
             .context(error::WriteObjectSnafu { path })
     });
 

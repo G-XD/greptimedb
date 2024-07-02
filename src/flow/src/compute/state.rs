@@ -25,7 +25,7 @@ use crate::utils::{ArrangeHandler, Arrangement};
 
 /// input/output of a dataflow
 /// One `ComputeState` manage the input/output/schedule of one `Hydroflow`
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DataflowState {
     /// it is important to use a deque to maintain the order of subgraph here
     /// TODO(discord9): consider dedup? Also not necessary for hydroflow itself also do dedup when schedule
@@ -42,6 +42,8 @@ pub struct DataflowState {
     /// save all used arrange in this dataflow, since usually there is no delete operation
     /// we can just keep track of all used arrange and schedule subgraph when they need to be updated
     arrange_used: Vec<ArrangeHandler>,
+    /// the time arrangement need to be expired after a certain time in milliseconds
+    expire_after: Option<Timestamp>,
 }
 
 impl DataflowState {
@@ -98,6 +100,14 @@ impl DataflowState {
 
     pub fn get_err_collector(&self) -> ErrCollector {
         self.err_collector.clone()
+    }
+
+    pub fn set_expire_after(&mut self, after: Option<repr::Duration>) {
+        self.expire_after = after;
+    }
+
+    pub fn expire_after(&self) -> Option<Timestamp> {
+        self.expire_after
     }
 }
 

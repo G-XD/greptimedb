@@ -18,13 +18,12 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use common_query::physical_plan::DfPhysicalPlanAdapter;
-use common_query::DfPhysicalPlan;
 use common_recordbatch::OrderOption;
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionState;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datatypes::arrow::datatypes::SchemaRef;
@@ -32,7 +31,7 @@ use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::RegionEngineRef;
 use store_api::storage::{RegionId, ScanRequest};
-use table::table::scan::StreamScanAdapter;
+use table::table::scan::RegionScanExec;
 
 use crate::error::{GetRegionMetadataSnafu, Result};
 
@@ -157,26 +156,21 @@ impl TableProvider for DummyTableProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn DfPhysicalPlan>> {
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let mut request = self.scan_request.lock().unwrap().clone();
         request.projection = match projection {
             Some(x) if !x.is_empty() => Some(x.clone()),
             _ => None,
         };
-        request.filters = filters
-            .iter()
-            .map(|e| common_query::logical_plan::Expr::from(e.clone()))
-            .collect();
+        request.filters = filters.to_vec();
         request.limit = limit;
 
-        let stream = self
+        let scanner = self
             .engine
             .handle_query(self.region_id, request)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(DfPhysicalPlanAdapter(Arc::new(
-            StreamScanAdapter::new(stream),
-        ))))
+        Ok(Arc::new(RegionScanExec::new(scanner)))
     }
 
     fn supports_filters_pushdown(

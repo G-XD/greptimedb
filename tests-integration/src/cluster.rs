@@ -17,15 +17,15 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::v1::meta::Role;
 use api::v1::region::region_server::RegionServer;
 use arrow_flight::flight_service_server::FlightServiceServer;
+use cache::{build_fundamental_cache_registry, with_default_composite_cache_registry};
 use catalog::kvbackend::{CachedMetaKvBackendBuilder, KvBackendCatalogManager, MetaKvBackend};
-use client::client_manager::DatanodeClients;
+use client::client_manager::NodeClients;
 use client::Client;
 use common_base::Plugins;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
-use common_meta::cache_invalidator::MultiCacheInvalidator;
+use common_meta::cache::{CacheRegistryBuilder, LayeredCacheRegistryBuilder};
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
 use common_meta::heartbeat::handler::HandlerGroupExecutor;
 use common_meta::kv_backend::chroot::ChrootKvBackend;
@@ -53,6 +53,7 @@ use servers::grpc::region_server::RegionServerRequestHandler;
 use servers::heartbeat_options::HeartbeatOptions;
 use servers::Mode;
 use tempfile::TempDir;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
 use tower::service_fn;
 use uuid::Uuid;
@@ -167,7 +168,7 @@ impl GreptimeDbClusterBuilder {
     ) -> GreptimeDbCluster {
         let datanodes = datanode_options.len();
         let channel_config = ChannelConfig::new().timeout(Duration::from_secs(20));
-        let datanode_clients = Arc::new(DatanodeClients::new(channel_config));
+        let datanode_clients = Arc::new(NodeClients::new(channel_config));
 
         let opt = MetasrvOptions {
             procedure: ProcedureConfig {
@@ -299,7 +300,7 @@ impl GreptimeDbClusterBuilder {
     ) {
         for _ in 0..10 {
             let alive_datanodes =
-                meta_srv::lease::filter_datanodes(1000, meta_peer_client, |_, _| true)
+                meta_srv::lease::alive_datanodes(1000, meta_peer_client, u64::MAX)
                     .await
                     .unwrap()
                     .len();
@@ -312,12 +313,10 @@ impl GreptimeDbClusterBuilder {
     }
 
     async fn create_datanode(&self, opts: DatanodeOptions, metasrv: MockInfo) -> Datanode {
-        let mut meta_client = MetaClientBuilder::new(1000, opts.node_id.unwrap(), Role::Datanode)
-            .enable_router()
-            .enable_store()
-            .enable_heartbeat()
-            .channel_manager(metasrv.channel_manager)
-            .build();
+        let mut meta_client =
+            MetaClientBuilder::datanode_default_options(1000, opts.node_id.unwrap())
+                .channel_manager(metasrv.channel_manager)
+                .build();
         meta_client.start(&[&metasrv.server_addr]).await.unwrap();
 
         let meta_backend = Arc::new(MetaKvBackend {
@@ -339,53 +338,61 @@ impl GreptimeDbClusterBuilder {
     async fn build_frontend(
         &self,
         metasrv: MockInfo,
-        datanode_clients: Arc<DatanodeClients>,
+        datanode_clients: Arc<NodeClients>,
     ) -> Arc<FeInstance> {
-        let mut meta_client = MetaClientBuilder::new(1000, 0, Role::Frontend)
-            .enable_router()
-            .enable_store()
-            .enable_heartbeat()
+        let mut meta_client = MetaClientBuilder::frontend_default_options(1000)
             .channel_manager(metasrv.channel_manager)
-            .enable_procedure()
-            .enable_access_cluster_info()
             .build();
         meta_client.start(&[&metasrv.server_addr]).await.unwrap();
         let meta_client = Arc::new(meta_client);
 
         let cached_meta_backend =
             Arc::new(CachedMetaKvBackendBuilder::new(meta_client.clone()).build());
-        let multi_cache_invalidator = Arc::new(MultiCacheInvalidator::with_invalidators(vec![
-            cached_meta_backend.clone(),
-        ]));
+
+        let layered_cache_builder = LayeredCacheRegistryBuilder::default().add_cache_registry(
+            CacheRegistryBuilder::default()
+                .add_cache(cached_meta_backend.clone())
+                .build(),
+        );
+        let fundamental_cache_registry =
+            build_fundamental_cache_registry(Arc::new(MetaKvBackend::new(meta_client.clone())));
+        let cache_registry = Arc::new(
+            with_default_composite_cache_registry(
+                layered_cache_builder.add_cache_registry(fundamental_cache_registry),
+            )
+            .unwrap()
+            .build(),
+        );
+
         let catalog_manager = KvBackendCatalogManager::new(
             Mode::Distributed,
             Some(meta_client.clone()),
             cached_meta_backend.clone(),
-            multi_cache_invalidator.clone(),
-        )
-        .await;
+            cache_registry.clone(),
+        );
 
         let handlers_executor = HandlerGroupExecutor::new(vec![
             Arc::new(ParseMailboxMessageHandler),
-            Arc::new(InvalidateTableCacheHandler::new(
-                multi_cache_invalidator.clone(),
-            )),
+            Arc::new(InvalidateTableCacheHandler::new(cache_registry.clone())),
         ]);
 
+        let options = FrontendOptions::default();
         let heartbeat_task = HeartbeatTask::new(
-            &FrontendOptions::default(),
+            &options,
             meta_client.clone(),
             HeartbeatOptions::default(),
             Arc::new(handlers_executor),
         );
 
         let instance = FrontendBuilder::new(
+            options,
             cached_meta_backend.clone(),
+            cache_registry.clone(),
             catalog_manager,
             datanode_clients,
             meta_client,
         )
-        .with_cache_invalidator(multi_cache_invalidator)
+        .with_local_cache_invalidator(cache_registry)
         .with_heartbeat_task(heartbeat_task)
         .try_build()
         .await
@@ -396,7 +403,7 @@ impl GreptimeDbClusterBuilder {
 }
 
 async fn build_datanode_clients(
-    clients: Arc<DatanodeClients>,
+    clients: Arc<NodeClients>,
     instances: &HashMap<DatanodeId, Datanode>,
     datanodes: usize,
 ) {
@@ -428,8 +435,20 @@ async fn create_datanode_client(datanode: &Datanode) -> (String, Client) {
 
     let _handle = tokio::spawn(async move {
         Server::builder()
-            .add_service(FlightServiceServer::new(flight_handler))
-            .add_service(RegionServer::new(region_server_handler))
+            .add_service(
+                FlightServiceServer::new(flight_handler)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Zstd)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .send_compressed(CompressionEncoding::Zstd),
+            )
+            .add_service(
+                RegionServer::new(region_server_handler)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Zstd)
+                    .send_compressed(CompressionEncoding::Gzip)
+                    .send_compressed(CompressionEncoding::Zstd),
+            )
             .serve_with_incoming(futures::stream::iter(vec![Ok::<_, std::io::Error>(server)]))
             .await
     });

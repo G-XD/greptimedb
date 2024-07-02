@@ -14,7 +14,16 @@
 
 //! SST in parquet format.
 
-mod format;
+use std::sync::Arc;
+
+use common_base::readable_size::ReadableSize;
+use parquet::file::metadata::ParquetMetaData;
+
+use crate::sst::file::FileTimeRange;
+use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
+
+pub(crate) mod file_range;
+pub(crate) mod format;
 pub(crate) mod helper;
 pub(crate) mod metadata;
 mod page_reader;
@@ -23,14 +32,6 @@ pub mod row_group;
 mod row_selection;
 mod stats;
 pub mod writer;
-
-use std::sync::Arc;
-
-use common_base::readable_size::ReadableSize;
-use parquet::file::metadata::ParquetMetaData;
-
-use crate::sst::file::FileTimeRange;
-use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 
 /// Key of metadata in parquet SST.
 pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
@@ -66,6 +67,8 @@ pub struct SstInfo {
     pub file_size: u64,
     /// Number of rows.
     pub num_rows: usize,
+    /// Number of row groups
+    pub num_row_groups: u64,
     /// File Meta Data
     pub file_metadata: Option<Arc<ParquetMetaData>>,
     /// Whether inverted index is available.
@@ -81,16 +84,26 @@ mod tests {
     use common_time::Timestamp;
     use datafusion_common::{Column, ScalarValue};
     use datafusion_expr::{BinaryExpr, Expr, Operator};
+    use datatypes::arrow;
+    use datatypes::arrow::array::RecordBatch;
+    use datatypes::arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::AsyncArrowWriter;
+    use parquet::basic::{Compression, Encoding, ZstdLevel};
+    use parquet::file::metadata::KeyValue;
+    use parquet::file::properties::WriterProperties;
     use table::predicate::Predicate;
+    use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
     use super::*;
     use crate::cache::{CacheManager, PageKey};
     use crate::sst::index::Indexer;
+    use crate::sst::parquet::format::WriteFormat;
     use crate::sst::parquet::reader::ParquetReaderBuilder;
     use crate::sst::parquet::writer::ParquetWriter;
+    use crate::sst::DEFAULT_WRITE_CONCURRENCY;
     use crate::test_util::sst_util::{
-        assert_parquet_metadata_eq, new_batch_by_range, new_source, sst_file_handle,
-        sst_region_metadata,
+        assert_parquet_metadata_eq, build_test_binary_test_region_metadata, new_batch_by_range,
+        new_batch_with_binary, new_source, sst_file_handle, sst_region_metadata,
     };
     use crate::test_util::{check_reader_result, TestEnv};
 
@@ -113,13 +126,13 @@ mod tests {
             row_group_size: 50,
             ..Default::default()
         };
-
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store.clone(),
             file_path,
             metadata,
-            object_store.clone(),
             Indexer::default(),
         );
+
         let info = writer
             .write_all(source, &write_opts)
             .await
@@ -168,12 +181,13 @@ mod tests {
             ..Default::default()
         };
         // Prepare data.
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store.clone(),
             file_path,
             metadata.clone(),
-            object_store.clone(),
             Indexer::default(),
         );
+
         writer
             .write_all(source, &write_opts)
             .await
@@ -242,12 +256,13 @@ mod tests {
 
         // write the sst file and get sst info
         // sst info contains the parquet metadata, which is converted from FileMetaData
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store.clone(),
             file_path,
             metadata.clone(),
-            object_store.clone(),
             Indexer::default(),
         );
+
         let sst_info = writer
             .write_all(source, &write_opts)
             .await
@@ -281,10 +296,10 @@ mod tests {
             ..Default::default()
         };
         // Prepare data.
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store.clone(),
             file_path,
             metadata.clone(),
-            object_store.clone(),
             Indexer::default(),
         );
         writer
@@ -301,8 +316,7 @@ mod tests {
             })),
             op: Operator::Eq,
             right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("a".to_string())))),
-        })
-        .into()]));
+        })]));
 
         let builder = ParquetReaderBuilder::new(FILE_DIR.to_string(), handle.clone(), object_store)
             .predicate(predicate);
@@ -335,10 +349,10 @@ mod tests {
             ..Default::default()
         };
         // Prepare data.
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store.clone(),
             file_path,
             metadata.clone(),
-            object_store.clone(),
             Indexer::default(),
         );
         writer
@@ -370,12 +384,13 @@ mod tests {
             ..Default::default()
         };
         // Prepare data.
-        let mut writer = ParquetWriter::new(
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store.clone(),
             file_path,
             metadata.clone(),
-            object_store.clone(),
             Indexer::default(),
         );
+
         writer
             .write_all(source, &write_opts)
             .await
@@ -390,12 +405,100 @@ mod tests {
             })),
             op: Operator::GtEq,
             right: Box::new(Expr::Literal(ScalarValue::UInt64(Some(150)))),
-        })
-        .into()]));
+        })]));
 
         let builder = ParquetReaderBuilder::new(FILE_DIR.to_string(), handle.clone(), object_store)
             .predicate(predicate);
         let mut reader = builder.build().await.unwrap();
         check_reader_result(&mut reader, &[new_batch_by_range(&["b", "h"], 150, 200)]).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_large_binary() {
+        let mut env = TestEnv::new();
+        let object_store = env.init_object_store_manager();
+        let handle = sst_file_handle(0, 1000);
+        let file_path = handle.file_path(FILE_DIR);
+
+        let write_opts = WriteOptions {
+            row_group_size: 50,
+            ..Default::default()
+        };
+
+        let metadata = build_test_binary_test_region_metadata();
+        let json = metadata.to_json().unwrap();
+        let key_value_meta = KeyValue::new(PARQUET_METADATA_KEY.to_string(), json);
+
+        let props_builder = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![key_value_meta]))
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_encoding(Encoding::PLAIN)
+            .set_max_row_group_size(write_opts.row_group_size);
+
+        let writer_props = props_builder.build();
+
+        let write_format = WriteFormat::new(metadata);
+        let fields: Vec<_> = write_format
+            .arrow_schema()
+            .fields()
+            .into_iter()
+            .map(|field| {
+                let data_type = field.data_type().clone();
+                if data_type == DataType::Binary {
+                    Field::new(field.name(), DataType::LargeBinary, field.is_nullable())
+                } else {
+                    Field::new(field.name(), data_type, field.is_nullable())
+                }
+            })
+            .collect();
+
+        let arrow_schema = Arc::new(Schema::new(fields));
+
+        // Ensures field_0 has LargeBinary type.
+        assert_eq!(
+            &DataType::LargeBinary,
+            arrow_schema.field_with_name("field_0").unwrap().data_type()
+        );
+        let mut writer = AsyncArrowWriter::try_new(
+            object_store
+                .writer_with(&file_path)
+                .concurrent(DEFAULT_WRITE_CONCURRENCY)
+                .await
+                .map(|w| w.into_futures_async_write().compat_write())
+                .unwrap(),
+            arrow_schema.clone(),
+            Some(writer_props),
+        )
+        .unwrap();
+
+        let batch = new_batch_with_binary(&["a"], 0, 60);
+        let arrow_batch = write_format.convert_batch(&batch).unwrap();
+        let arrays: Vec<_> = arrow_batch
+            .columns()
+            .iter()
+            .map(|array| {
+                let data_type = array.data_type().clone();
+                if data_type == DataType::Binary {
+                    arrow::compute::cast(array, &DataType::LargeBinary).unwrap()
+                } else {
+                    array.clone()
+                }
+            })
+            .collect();
+        let result = RecordBatch::try_new(arrow_schema, arrays).unwrap();
+
+        writer.write(&result).await.unwrap();
+        writer.close().await.unwrap();
+
+        let builder = ParquetReaderBuilder::new(FILE_DIR.to_string(), handle.clone(), object_store);
+        let mut reader = builder.build().await.unwrap();
+        check_reader_result(
+            &mut reader,
+            &[
+                new_batch_with_binary(&["a"], 0, 50),
+                new_batch_with_binary(&["a"], 50, 60),
+            ],
+        )
+        .await;
     }
 }

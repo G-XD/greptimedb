@@ -20,6 +20,7 @@ use sqlparser::ast::{Expr, Query};
 use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::{ColumnDef, Ident, ObjectName, TableConstraint, Value as SqlValue};
+use crate::statements::statement::Statement;
 use crate::statements::OptionMap;
 
 const LINE_SEP: &str = ",\n";
@@ -71,7 +72,6 @@ pub const TIME_INDEX: &str = "__time_index";
 pub fn is_time_index(constraint: &TableConstraint) -> bool {
     matches!(constraint, TableConstraint::Unique {
         name: Some(name),
-        is_primary: false,
         ..
     }  if name.value == TIME_INDEX)
 }
@@ -168,14 +168,16 @@ pub struct CreateDatabase {
     pub name: ObjectName,
     /// Create if not exists
     pub if_not_exists: bool,
+    pub options: OptionMap,
 }
 
 impl CreateDatabase {
     /// Creates a statement for `CREATE DATABASE`
-    pub fn new(name: ObjectName, if_not_exists: bool) -> Self {
+    pub fn new(name: ObjectName, if_not_exists: bool, options: OptionMap) -> Self {
         Self {
             name,
             if_not_exists,
+            options,
         }
     }
 }
@@ -186,7 +188,12 @@ impl Display for CreateDatabase {
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
-        write!(f, "{}", &self.name)
+        write!(f, "{}", &self.name)?;
+        if !self.options.is_empty() {
+            let options = self.options.kv_pairs();
+            write!(f, "\nWITH(\n{}\n)", format_list_indent!(options))?;
+        }
+        Ok(())
     }
 }
 
@@ -247,8 +254,9 @@ pub struct CreateFlow {
     pub or_replace: bool,
     /// Create if not exist
     pub if_not_exists: bool,
-    /// `EXPIRE_WHEN`
-    pub expire_when: Option<Expr>,
+    /// `EXPIRE AFTER`
+    /// Duration in second as `i64`
+    pub expire_after: Option<i64>,
     /// Comment string
     pub comment: Option<String>,
     /// SQL statement
@@ -261,18 +269,47 @@ impl Display for CreateFlow {
         if self.or_replace {
             write!(f, "OR REPLACE ")?;
         }
-        write!(f, "TASK ")?;
+        write!(f, "FLOW ")?;
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
-        write!(f, "{} ", &self.flow_name)?;
-        write!(f, "OUTPUT AS {} ", &self.sink_table_name)?;
-        if let Some(expire_when) = &self.expire_when {
-            write!(f, "EXPIRE WHEN {} ", expire_when)?;
+        writeln!(f, "{}", &self.flow_name)?;
+        writeln!(f, "SINK TO {}", &self.sink_table_name)?;
+        if let Some(expire_after) = &self.expire_after {
+            writeln!(f, "EXPIRE AFTER {} ", expire_after)?;
         }
         if let Some(comment) = &self.comment {
-            write!(f, "COMMENT '{}' ", comment)?;
+            writeln!(f, "COMMENT '{}'", comment)?;
         }
+        write!(f, "AS {}", &self.query)
+    }
+}
+
+/// Create SQL view statement.
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
+pub struct CreateView {
+    /// View name
+    pub name: ObjectName,
+    /// The clause after `As` that defines the VIEW.
+    /// Can only be either [Statement::Query] or [Statement::Tql].
+    pub query: Box<Statement>,
+    /// Whether to replace existing VIEW
+    pub or_replace: bool,
+    /// Create VIEW only when it doesn't exists
+    pub if_not_exists: bool,
+}
+
+impl Display for CreateView {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CREATE ")?;
+        if self.or_replace {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "VIEW ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        write!(f, "{} ", &self.name)?;
         write!(f, "AS {}", &self.query)
     }
 }
@@ -475,6 +512,30 @@ CREATE DATABASE IF NOT EXISTS test"#,
                 unreachable!();
             }
         }
+
+        let sql = r#"CREATE DATABASE IF NOT EXISTS test WITH (ttl='1h');"#;
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::CreateDatabase { .. });
+
+        match &stmts[0] {
+            Statement::CreateDatabase(set) => {
+                let new_sql = format!("\n{}", set);
+                assert_eq!(
+                    r#"
+CREATE DATABASE IF NOT EXISTS test
+WITH(
+  ttl = '1h'
+)"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
     }
 
     #[test]
@@ -541,6 +602,39 @@ WITH(
             _ => {
                 unreachable!();
             }
+        }
+    }
+
+    #[test]
+    fn test_display_create_flow() {
+        let sql = r"CREATE FLOW filter_numbers
+            SINK TO out_num_cnt
+            AS SELECT number FROM numbers_input where number > 10;";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, result.len());
+
+        match &result[0] {
+            Statement::CreateFlow(c) => {
+                let new_sql = format!("\n{}", c);
+                assert_eq!(
+                    r#"
+CREATE FLOW filter_numbers
+SINK TO out_num_cnt
+AS SELECT number FROM numbers_input WHERE number > 10"#,
+                    &new_sql
+                );
+
+                let new_result = ParserContext::create_with_dialect(
+                    &new_sql,
+                    &GreptimeDbDialect {},
+                    ParseOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(result, new_result);
+            }
+            _ => unreachable!(),
         }
     }
 }
